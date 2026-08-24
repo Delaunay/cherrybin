@@ -35,6 +35,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -82,6 +83,22 @@ class BenchmarkStats:
     name: str
     file_count: int
     total_bytes: int
+
+
+@dataclass
+class IndexStats:
+    """Result of an incremental per-benchmark index."""
+
+    name: str
+    added: int
+    removed: int
+    unchanged: int
+    new_bytes: int
+    file_count: int
+
+    @property
+    def changed(self) -> bool:
+        return self.added > 0 or self.removed > 0
 
 
 def sha256_file(path: str) -> str:
@@ -150,6 +167,113 @@ def add_benchmark(con: sqlite3.Connection, source_root: str, benchmark: str) -> 
     return BenchmarkStats(name=benchmark, file_count=n_files, total_bytes=new_bytes)
 
 
+def _prefixed_relpath(full_path: str, root: str, prefix: str) -> str:
+    relpath = os.path.relpath(full_path, root).replace(os.sep, "/")
+    prefix = prefix.strip("/")
+    if prefix:
+        return f"{prefix}/{relpath}"
+    return relpath
+
+
+def _walk_roots(roots: list[tuple[str, str]]) -> dict[str, tuple[str, float, str, int]]:
+    """Return {relpath: (digest, mtime, full_path, size)} for every file under roots."""
+    found: dict[str, tuple[str, float, str, int]] = {}
+    for abs_dir, prefix in roots:
+        if not os.path.isdir(abs_dir):
+            continue
+        for root, _, files in os.walk(abs_dir):
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                relpath = _prefixed_relpath(full_path, abs_dir, prefix)
+                found[relpath] = (
+                    sha256_file(full_path),
+                    os.path.getmtime(full_path),
+                    full_path,
+                    os.path.getsize(full_path),
+                )
+    return found
+
+
+def _ensure_blob(con: sqlite3.Connection, digest: str, full_path: str, size: int) -> int:
+    """Insert the blob if missing. Returns bytes written (0 if already present)."""
+    exists = con.execute("SELECT 1 FROM blobs WHERE hash = ?", (digest,)).fetchone()
+    if exists is not None:
+        return 0
+    with open(full_path, "rb") as f:
+        data = f.read()
+    con.execute(
+        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, ?)",
+        (digest, size, data),
+    )
+    return size
+
+
+def index_roots(
+    con: sqlite3.Connection,
+    name: str,
+    roots: list[tuple[str, str]],
+) -> IndexStats:
+    """Incrementally sync one benchmark's file list from ``roots``.
+
+    ``roots`` is a list of ``(abs_dir, prefix)``. Files are stored as
+    ``<prefix>/<relpath>`` (prefix may be empty). New blobs are inserted,
+    vanished files are dropped from this benchmark only, unchanged rows
+    are left alone.
+    """
+    old = {
+        relpath: digest
+        for relpath, digest in con.execute(
+            "SELECT relpath, hash FROM benchmark_files WHERE benchmark = ?",
+            (name,),
+        )
+    }
+    new = _walk_roots(roots)
+
+    added = 0
+    removed = 0
+    unchanged = 0
+    new_bytes = 0
+
+    for relpath, (digest, mtime, full_path, size) in new.items():
+        old_hash = old.get(relpath)
+        if old_hash == digest:
+            unchanged += 1
+            continue
+
+        new_bytes += _ensure_blob(con, digest, full_path, size)
+        if old_hash is None:
+            con.execute(
+                "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
+                "VALUES (?, ?, ?, ?)",
+                (name, relpath, digest, mtime),
+            )
+        else:
+            con.execute(
+                "UPDATE benchmark_files SET hash = ?, mtime = ? "
+                "WHERE benchmark = ? AND relpath = ?",
+                (digest, mtime, name, relpath),
+            )
+        added += 1
+
+    for relpath in old:
+        if relpath not in new:
+            con.execute(
+                "DELETE FROM benchmark_files WHERE benchmark = ? AND relpath = ?",
+                (name, relpath),
+            )
+            removed += 1
+
+    con.commit()
+    return IndexStats(
+        name=name,
+        added=added,
+        removed=removed,
+        unchanged=unchanged,
+        new_bytes=new_bytes,
+        file_count=len(new),
+    )
+
+
 def remove_benchmark(con: sqlite3.Connection, benchmark: str) -> int:
     cur = con.execute("DELETE FROM benchmark_files WHERE benchmark = ?", (benchmark,))
     con.commit()
@@ -191,9 +315,23 @@ def publish_lock(shared_dir: str, timeout: float = 600):
     already makes concurrent reads safe with no locking at all.
     """
     os.makedirs(shared_dir, exist_ok=True)
-    lock_path = os.path.join(shared_dir, ".publish.lock")
-    info = f"{socket.gethostname()} pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    with publish_lock_path(os.path.join(shared_dir, ".publish.lock"), timeout=timeout):
+        yield
 
+
+@contextlib.contextmanager
+def file_lock(db_path: str, timeout: float = 600):
+    """Advisory lock beside a shared ``.db`` file (``<db>.publish.lock``)."""
+    parent = os.path.dirname(os.path.abspath(db_path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    with publish_lock_path(os.path.abspath(db_path) + ".publish.lock", timeout=timeout):
+        yield
+
+
+@contextlib.contextmanager
+def publish_lock_path(lock_path: str, timeout: float = 600):
+    """O_CREAT|O_EXCL lock at an explicit path."""
+    info = f"{socket.gethostname()} pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     start = time.time()
     while True:
         try:
@@ -216,7 +354,10 @@ def publish_lock(shared_dir: str, timeout: float = 600):
     try:
         yield
     finally:
-        os.remove(lock_path)
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
 
 
 def publish(local_path: str, shared_dir: str, version: str) -> str:
@@ -250,6 +391,90 @@ def resolve_current(shared_dir: str) -> str:
     with open(pointer_path) as f:
         name = f.read().strip()
     return os.path.join(shared_dir, name)
+
+
+def _checkpoint_and_close(con: sqlite3.Connection) -> None:
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+
+
+def replace_file(src: str, dest: str) -> str:
+    """Copy ``src`` next to ``dest`` as ``.uploading``, then atomically replace."""
+    dest = os.path.abspath(dest)
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    tmp_path = dest + ".uploading"
+    shutil.copyfile(src, tmp_path)
+    os.replace(tmp_path, dest)
+    return dest
+
+
+def update_files(
+    shared_db: str,
+    items: list[tuple[str, list[tuple[str, str]]]],
+    *,
+    lock_timeout: float = 600.0,
+) -> list[IndexStats]:
+    """Create or incrementally update ``shared_db`` from named root lists.
+
+    Never mutates the live file in place: copy locally, index, then
+    ``os.replace`` via ``*.uploading`` if anything changed (or the file
+    is being created).
+    """
+    shared_db = os.path.abspath(shared_db)
+    existed = os.path.exists(shared_db)
+
+    with file_lock(shared_db, timeout=lock_timeout):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "local.db")
+            if existed:
+                shutil.copyfile(shared_db, local)
+
+            con = connect_writable(local)
+            stats = []
+            try:
+                for name, roots in items:
+                    stats.append(index_roots(con, name, roots))
+            finally:
+                _checkpoint_and_close(con)
+
+            any_changed = any(s.changed for s in stats)
+            if any_changed or not existed:
+                replace_file(local, shared_db)
+
+    return stats
+
+
+def update_file(
+    shared_db: str,
+    name: str,
+    roots: list[tuple[str, str]],
+    *,
+    lock_timeout: float = 600.0,
+) -> IndexStats:
+    """Create or incrementally update one benchmark in ``shared_db``."""
+    return update_files(shared_db, [(name, roots)], lock_timeout=lock_timeout)[0]
+
+
+def list_files(db_path: str, benchmark: str) -> list[tuple[str, str]]:
+    """Return ``[(relpath, hash), ...]`` for one benchmark."""
+    con = open_readonly(db_path)
+    try:
+        return con.execute(
+            "SELECT relpath, hash FROM benchmark_files WHERE benchmark = ? ORDER BY relpath",
+            (benchmark,),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def link_or_copy(src: str, dest: str) -> None:
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    if os.path.exists(dest):
+        os.remove(dest)
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copyfile(src, dest)
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +534,7 @@ def checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> Checkou
             else:
                 n_from_cache += 1
 
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-            try:
-                os.link(cache_path, dest_path)
-            except OSError:
-                shutil.copyfile(cache_path, dest_path)
+            link_or_copy(cache_path, dest_path)
 
         return CheckoutResult(
             benchmark=benchmark,

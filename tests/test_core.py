@@ -7,10 +7,14 @@ from cherrybin.core import (
     checkout,
     connect_writable,
     gc_unreferenced_blobs,
+    index_roots,
     list_benchmarks,
+    list_files,
     publish,
     remove_benchmark,
     resolve_current,
+    update_file,
+    update_files,
 )
 
 
@@ -120,3 +124,131 @@ def test_second_publish_gets_new_version(tmp_path, source_tree):
 
     assert resolve_current(shared_dir).endswith("archive_v2.db")
     assert os.path.exists(os.path.join(shared_dir, "archive_v1.db"))  # old version kept
+
+
+def _write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def test_index_roots_prefixes_and_incremental(tmp_path):
+    data = tmp_path / "data" / "vllm"
+    cache = tmp_path / "cache" / "vllm"
+    _write(str(data / "hub" / "model.bin"), "weights")
+    _write(str(cache / "torch" / "hub.bin"), "torch")
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    stats = index_roots(
+        con,
+        "vllm",
+        [(str(data), "data"), (str(cache), "cache")],
+    )
+    con.close()
+
+    assert stats.added == 2
+    assert stats.removed == 0
+    assert stats.unchanged == 0
+    assert stats.file_count == 2
+    assert stats.changed
+
+    paths = {rel for rel, _ in list_files(db_path, "vllm")}
+    assert paths == {"data/hub/model.bin", "cache/torch/hub.bin"}
+
+    # Second index with the same trees is a no-op
+    con = connect_writable(db_path)
+    again = index_roots(
+        con,
+        "vllm",
+        [(str(data), "data"), (str(cache), "cache")],
+    )
+    assert again.added == 0
+    assert again.removed == 0
+    assert again.unchanged == 2
+    assert not again.changed
+
+    # Add one file, delete one file
+    os.remove(data / "hub" / "model.bin")
+    _write(str(data / "hub" / "new.bin"), "fresh")
+    stats = index_roots(
+        con,
+        "vllm",
+        [(str(data), "data"), (str(cache), "cache")],
+    )
+    con.close()
+
+    assert stats.added == 1
+    assert stats.removed == 1
+    assert stats.unchanged == 1
+    assert stats.changed
+    paths = {rel for rel, _ in list_files(db_path, "vllm")}
+    assert paths == {"data/hub/new.bin", "cache/torch/hub.bin"}
+
+
+def test_index_roots_shared_blob_kept_when_one_bench_drops(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    _write(str(a / "shared.bin"), "same")
+    _write(str(a / "only_a.bin"), "a")
+    _write(str(b / "shared.bin"), "same")
+    _write(str(b / "only_b.bin"), "b")
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    index_roots(con, "bench_a", [(str(a), "")])
+    index_roots(con, "bench_b", [(str(b), "")])
+    n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+    assert n_blobs == 3
+
+    os.remove(a / "only_a.bin")
+    index_roots(con, "bench_a", [(str(a), "")])
+    n_blobs_after = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+    con.close()
+
+    # only_a blob is unreferenced but not deleted until gc
+    assert n_blobs_after == 3
+    paths_a = {rel for rel, _ in list_files(db_path, "bench_a")}
+    assert paths_a == {"shared.bin"}
+
+
+def test_update_file_creates_and_replaces(tmp_path):
+    tree = tmp_path / "tree" / "bench"
+    _write(str(tree / "a.bin"), "one")
+    shared = str(tmp_path / "shared" / "archive.db")
+
+    stats = update_file(shared, "bench", [(str(tree), "data")])
+    assert stats.added == 1
+    assert os.path.exists(shared)
+    assert list_files(shared, "bench")[0][0] == "data/a.bin"
+
+    inode_before = os.stat(shared).st_ino
+    unchanged = update_file(shared, "bench", [(str(tree), "data")])
+    assert not unchanged.changed
+    assert os.stat(shared).st_ino == inode_before
+
+    _write(str(tree / "b.bin"), "two")
+    changed = update_file(shared, "bench", [(str(tree), "data")])
+    assert changed.added == 1
+    assert changed.unchanged == 1
+    assert {rel for rel, _ in list_files(shared, "bench")} == {"data/a.bin", "data/b.bin"}
+
+    dest = str(tmp_path / "out")
+    result = checkout(shared, "bench", dest, str(tmp_path / "blob_cache"))
+    assert result.file_count == 2
+    assert os.path.exists(os.path.join(dest, "data", "a.bin"))
+
+
+def test_update_files_two_benchmarks(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    _write(str(a / "x.bin"), "x")
+    _write(str(b / "y.bin"), "y")
+    shared = str(tmp_path / "archive.db")
+
+    stats = update_files(
+        shared,
+        [("aa", [(str(a), "")]), ("bb", [(str(b), "")])],
+    )
+    assert [s.name for s in stats] == ["aa", "bb"]
+    assert {s.name for s in list_benchmarks(connect_writable(shared))} == {"aa", "bb"}
