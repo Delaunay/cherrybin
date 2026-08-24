@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cherrybin"
+version = "0.1.0"
+description = "Sqlite-backed content-addressed archive for selective checkout of large shared benchmark datasets"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.11"
+authors = [
+    { name = "Delaunay", email = "CHANGE_ME@example.com" },
+]
+dependencies = [
+    "argklass",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+    "ruff",
+    "pre-commit",
+]
+
+[project.scripts]
+"cherrybin" = "cherrybin.cli:main_force"
+
+[tool.setuptools.packages.find]
+include = ["cherrybin*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
