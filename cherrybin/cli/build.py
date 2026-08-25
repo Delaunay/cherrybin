@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from argklass.arguments import add_arguments
 from argklass.command import Command, newparser
 
-from cherrybin.core import add_benchmark, connect_writable
+from cherrybin.core import DEFAULT_IO_CHUNK, add_benchmark, connect_writable
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Arguments:
     db: str
     source: str
     benchmark: str = ""
+    io_chunk: int = DEFAULT_IO_CHUNK
 
 
 class Build(Command):
@@ -45,7 +46,7 @@ class Build(Command):
                 )
 
             for name in names:
-                stats = add_benchmark(con, args.source, name)
+                stats = add_benchmark(con, args.source, name, io_chunk=args.io_chunk)
                 print(
                     f"[{stats.name}] indexed {stats.file_count} files, "
                     f"wrote {stats.total_bytes / 1e6:.1f} MB of new blob data"

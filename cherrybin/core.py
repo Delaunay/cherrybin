@@ -37,6 +37,7 @@ import socket
 import sqlite3
 import tempfile
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 __version__ = "0.1.0"
@@ -88,10 +89,35 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-_HASH_CHUNK = 4 * 1024 * 1024  # 4MB I/O chunks (never load a whole file)
+# Default stream size for hashing / blob copy. Override via ``io_chunk=``
+# on the public APIs or ``--io-chunk`` on the CLI (bytes).
+DEFAULT_IO_CHUNK = 4 * 1024 * 1024
+_HASH_CHUNK = DEFAULT_IO_CHUNK
 # CPython's sqlite is built with SQLITE_MAX_LENGTH=1e9 (~954 MiB) per BLOB.
 # Stay 1 MiB under the hard cap; a 17 GiB file is then ~18 blobs.
 _BLOB_CHUNK = 1_000_000_000 - 1024 * 1024
+
+_io_chunk: ContextVar[int | None] = ContextVar("cherrybin_io_chunk", default=None)
+
+
+def _current_io_chunk() -> int:
+    override = _io_chunk.get()
+    return override if override is not None else _HASH_CHUNK
+
+
+@contextlib.contextmanager
+def using_io_chunk(size: int | None):
+    """Temporarily use ``size``-byte stream reads. ``None`` keeps the default."""
+    if size is None:
+        yield
+        return
+    if size < 1:
+        raise ValueError(f"io_chunk must be >= 1, got {size}")
+    token = _io_chunk.set(int(size))
+    try:
+        yield
+    finally:
+        _io_chunk.reset(token)
 
 
 @dataclass
@@ -117,15 +143,16 @@ class IndexStats:
         return self.added > 0 or self.removed > 0
 
 
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(_HASH_CHUNK)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
+def sha256_file(path: str, *, io_chunk: int | None = None) -> str:
+    with using_io_chunk(io_chunk):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(_current_io_chunk())
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -139,41 +166,48 @@ def connect_writable(db_path: str) -> sqlite3.Connection:
     return con
 
 
-def add_benchmark(con: sqlite3.Connection, source_root: str, benchmark: str) -> BenchmarkStats:
+def add_benchmark(
+    con: sqlite3.Connection,
+    source_root: str,
+    benchmark: str,
+    *,
+    io_chunk: int | None = None,
+) -> BenchmarkStats:
     """(Re)index one benchmark's files from <source_root>/<benchmark>/**."""
-    bench_dir = os.path.join(source_root, benchmark)
-    if not os.path.isdir(bench_dir):
-        raise FileNotFoundError(bench_dir)
+    with using_io_chunk(io_chunk):
+        bench_dir = os.path.join(source_root, benchmark)
+        if not os.path.isdir(bench_dir):
+            raise FileNotFoundError(bench_dir)
 
-    # Drop this benchmark's old file list; blobs are untouched since
-    # other benchmarks may still reference them.
-    con.execute("DELETE FROM benchmark_files WHERE benchmark = ?", (benchmark,))
+        # Drop this benchmark's old file list; blobs are untouched since
+        # other benchmarks may still reference them.
+        con.execute("DELETE FROM benchmark_files WHERE benchmark = ?", (benchmark,))
 
-    n_files = 0
-    n_new_blobs = 0
-    new_bytes = 0
+        n_files = 0
+        n_new_blobs = 0
+        new_bytes = 0
 
-    for root, _, files in os.walk(bench_dir):
-        for fname in files:
-            full_path = os.path.join(root, fname)
-            relpath = os.path.relpath(full_path, bench_dir).replace(os.sep, "/")
-            digest = sha256_file(full_path)
-            size = os.path.getsize(full_path)
-            mtime = os.path.getmtime(full_path)
+        for root, _, files in os.walk(bench_dir):
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                relpath = os.path.relpath(full_path, bench_dir).replace(os.sep, "/")
+                digest = sha256_file(full_path)
+                size = os.path.getsize(full_path)
+                mtime = os.path.getmtime(full_path)
 
-            if _ensure_blob(con, digest, full_path, size):
-                n_new_blobs += 1
-                new_bytes += size
+                if _ensure_blob(con, digest, full_path, size):
+                    n_new_blobs += 1
+                    new_bytes += size
 
-            con.execute(
-                "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
-                "VALUES (?, ?, ?, ?)",
-                (benchmark, relpath, digest, mtime),
-            )
-            n_files += 1
+                con.execute(
+                    "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
+                    "VALUES (?, ?, ?, ?)",
+                    (benchmark, relpath, digest, mtime),
+                )
+                n_files += 1
 
-    con.commit()
-    return BenchmarkStats(name=benchmark, file_count=n_files, total_bytes=new_bytes)
+        con.commit()
+        return BenchmarkStats(name=benchmark, file_count=n_files, total_bytes=new_bytes)
 
 
 def _prefixed_relpath(full_path: str, root: str, prefix: str) -> str:
@@ -207,7 +241,8 @@ def _copy_file_to_blob(src, dest, size: int | None = None) -> None:
     """Copy ``src`` to ``dest`` in chunks. Both are file-like."""
     remaining = size
     while remaining is None or remaining > 0:
-        n = _HASH_CHUNK if remaining is None else min(_HASH_CHUNK, remaining)
+        step = _current_io_chunk()
+        n = step if remaining is None else min(step, remaining)
         chunk = src.read(n)
         if not chunk:
             break
@@ -288,7 +323,7 @@ def _insert_chunked_file(
                 copied = 0
                 with os.fdopen(fd, "wb") as tmp:
                     while copied < _BLOB_CHUNK:
-                        buf = src.read(min(_HASH_CHUNK, _BLOB_CHUNK - copied))
+                        buf = src.read(min(_current_io_chunk(), _BLOB_CHUNK - copied))
                         if not buf:
                             break
                         hasher.update(buf)
@@ -328,6 +363,8 @@ def index_roots(
     con: sqlite3.Connection,
     name: str,
     roots: list[tuple[str, str]],
+    *,
+    io_chunk: int | None = None,
 ) -> IndexStats:
     """Incrementally sync one benchmark's file list from ``roots``.
 
@@ -336,6 +373,15 @@ def index_roots(
     vanished files are dropped from this benchmark only, unchanged rows
     are left alone.
     """
+    with using_io_chunk(io_chunk):
+        return _index_roots(con, name, roots)
+
+
+def _index_roots(
+    con: sqlite3.Connection,
+    name: str,
+    roots: list[tuple[str, str]],
+) -> IndexStats:
     old = {
         relpath: digest
         for relpath, digest in con.execute(
@@ -536,6 +582,7 @@ def update_files(
     items: list[tuple[str, list[tuple[str, str]]]],
     *,
     lock_timeout: float = 600.0,
+    io_chunk: int | None = None,
 ) -> list[IndexStats]:
     """Create or incrementally update ``shared_db`` from named root lists.
 
@@ -556,7 +603,7 @@ def update_files(
             stats = []
             try:
                 for name, roots in items:
-                    stats.append(index_roots(con, name, roots))
+                    stats.append(index_roots(con, name, roots, io_chunk=io_chunk))
             finally:
                 _checkpoint_and_close(con)
 
@@ -573,9 +620,12 @@ def update_file(
     roots: list[tuple[str, str]],
     *,
     lock_timeout: float = 600.0,
+    io_chunk: int | None = None,
 ) -> IndexStats:
     """Create or incrementally update one benchmark in ``shared_db``."""
-    return update_files(shared_db, [(name, roots)], lock_timeout=lock_timeout)[0]
+    return update_files(
+        shared_db, [(name, roots)], lock_timeout=lock_timeout, io_chunk=io_chunk
+    )[0]
 
 
 def list_files(db_path: str, benchmark: str) -> list[tuple[str, str]]:
@@ -622,7 +672,19 @@ class CheckoutResult:
     already_cached: int
 
 
-def checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> CheckoutResult:
+def checkout(
+    db_path: str,
+    benchmark: str,
+    dest: str,
+    cache_dir: str,
+    *,
+    io_chunk: int | None = None,
+) -> CheckoutResult:
+    with using_io_chunk(io_chunk):
+        return _checkout(db_path, benchmark, dest, cache_dir)
+
+
+def _checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> CheckoutResult:
     con = open_readonly(db_path)
     try:
         rows = con.execute(

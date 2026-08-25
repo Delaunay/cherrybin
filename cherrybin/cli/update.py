@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from argklass.arguments import add_arguments, argument
 from argklass.command import Command, newparser
 
-from cherrybin.core import update_file
+from cherrybin.core import DEFAULT_IO_CHUNK, update_file
 
 
 def parse_root_spec(spec: str) -> tuple[str, str]:
@@ -25,6 +25,7 @@ class Arguments:
     benchmark: str
     root: list[str] = argument(default=[], action="append")
     lock_timeout: float = 600.0
+    io_chunk: int = DEFAULT_IO_CHUNK
 
 
 class Update(Command):
@@ -54,6 +55,7 @@ class Update(Command):
             args.benchmark,
             parsed,
             lock_timeout=args.lock_timeout,
+            io_chunk=args.io_chunk,
         )
 
         print(

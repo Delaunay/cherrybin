@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from argklass.arguments import add_arguments
 from argklass.command import Command, newparser
 
-from cherrybin.core import checkout, resolve_current
+from cherrybin.core import DEFAULT_IO_CHUNK, checkout, resolve_current
 
 
 @dataclass
@@ -17,6 +17,7 @@ class Arguments:
     cache: str
     db: str = ""
     shared_dir: str = ""
+    io_chunk: int = DEFAULT_IO_CHUNK
 
 
 class Checkout(Command):
@@ -45,7 +46,9 @@ class Checkout(Command):
             return 1
 
         try:
-            result = checkout(db_path, args.benchmark, args.dest, args.cache)
+            result = checkout(
+                db_path, args.benchmark, args.dest, args.cache, io_chunk=args.io_chunk
+            )
         except (FileNotFoundError, KeyError) as e:
             print(f"error: {e}")
             return 1

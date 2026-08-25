@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from cherrybin.core import (
     add_benchmark,
     checkout,
@@ -15,6 +17,7 @@ from cherrybin.core import (
     resolve_current,
     update_file,
     update_files,
+    using_io_chunk,
 )
 
 
@@ -65,6 +68,39 @@ def test_checkout_streams_blob_larger_than_chunk(tmp_path, monkeypatch):
     dest = str(tmp_path / "out")
     checkout(db_path, "bench", dest, str(tmp_path / "cache"))
     assert open(os.path.join(dest, "big.bin"), "rb").read() == payload
+
+
+def test_io_chunk_kwarg_overrides_default(tmp_path, monkeypatch):
+    import cherrybin.core as core
+
+    seen = []
+    real_read = core._current_io_chunk
+
+    def spy():
+        n = real_read()
+        seen.append(n)
+        return n
+
+    monkeypatch.setattr(core, "_current_io_chunk", spy)
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    (src / "a.bin").write_bytes(b"x" * 64)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench", io_chunk=16)
+    con.close()
+
+    checkout(db_path, "bench", str(tmp_path / "out"), str(tmp_path / "cache"), io_chunk=32)
+    assert 16 in seen
+    assert 32 in seen
+    assert open(os.path.join(tmp_path, "out", "a.bin"), "rb").read() == b"x" * 64
+
+
+def test_using_io_chunk_rejects_non_positive():
+    with pytest.raises(ValueError):
+        with using_io_chunk(0):
+            pass
 
 
 def test_checkout_materializes_correct_files(tmp_path, source_tree):
