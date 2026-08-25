@@ -48,6 +48,25 @@ def test_dedup_stores_shared_blob_once(tmp_path, source_tree):
     assert n_blobs == 3
 
 
+def test_checkout_streams_blob_larger_than_chunk(tmp_path, monkeypatch):
+    import cherrybin.core as core
+
+    monkeypatch.setattr(core, "_HASH_CHUNK", 16)
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    payload = b"abcdefghij" * 20  # 200 bytes, many 16-byte chunks
+    (src / "big.bin").write_bytes(payload)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench")
+    con.close()
+
+    dest = str(tmp_path / "out")
+    checkout(db_path, "bench", dest, str(tmp_path / "cache"))
+    assert open(os.path.join(dest, "big.bin"), "rb").read() == payload
+
+
 def test_checkout_materializes_correct_files(tmp_path, source_tree):
     db_path = build_local_db(tmp_path, source_tree)
     dest = str(tmp_path / "out" / "bench_a")
@@ -237,6 +256,57 @@ def test_update_file_creates_and_replaces(tmp_path):
     result = checkout(shared, "bench", dest, str(tmp_path / "blob_cache"))
     assert result.file_count == 2
     assert os.path.exists(os.path.join(dest, "data", "a.bin"))
+
+
+def test_chunked_file_round_trip(tmp_path, monkeypatch):
+    import cherrybin.core as core
+
+    monkeypatch.setattr(core, "_BLOB_CHUNK", 32)
+    payload = os.urandom(512)  # 512 bytes -> 16 chunks of 32
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    (src / "huge.bin").write_bytes(payload)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench")
+    n_chunks = con.execute("SELECT COUNT(*) FROM file_chunks").fetchone()[0]
+    n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+    file_hash = con.execute("SELECT hash FROM benchmark_files").fetchone()[0]
+    placeholder = con.execute(
+        "SELECT size, length(data) FROM blobs WHERE hash = ?", (file_hash,)
+    ).fetchone()
+    con.close()
+
+    assert n_chunks == 16
+    assert n_blobs >= 2  # placeholder + at least one chunk
+    assert placeholder == (512, 0)
+
+    dest = str(tmp_path / "out")
+    checkout(db_path, "bench", dest, str(tmp_path / "cache"))
+    assert open(os.path.join(dest, "huge.bin"), "rb").read() == payload
+
+
+def test_chunked_file_gc_after_remove(tmp_path, monkeypatch):
+    import cherrybin.core as core
+
+    monkeypatch.setattr(core, "_BLOB_CHUNK", 32)
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    (src / "huge.bin").write_bytes(b"x" * 80)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench")
+    remove_benchmark(con, "bench")
+    removed = gc_unreferenced_blobs(con)
+    n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+    n_chunks = con.execute("SELECT COUNT(*) FROM file_chunks").fetchone()[0]
+    con.close()
+
+    assert removed >= 1
+    assert n_blobs == 0
+    assert n_chunks == 0
 
 
 def test_update_files_two_benchmarks(tmp_path):

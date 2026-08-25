@@ -69,13 +69,29 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_files_benchmark
 CREATE INDEX IF NOT EXISTS idx_benchmark_files_hash
     ON benchmark_files(hash);
 
+CREATE TABLE IF NOT EXISTS file_chunks (
+    hash       TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL REFERENCES blobs(hash),
+    PRIMARY KEY (hash, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_chunks_hash
+    ON file_chunks(hash);
+
+CREATE INDEX IF NOT EXISTS idx_file_chunks_chunk
+    ON file_chunks(chunk_hash);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
 """
 
-_HASH_CHUNK = 4 * 1024 * 1024  # 4MB read chunks for hashing large files
+_HASH_CHUNK = 4 * 1024 * 1024  # 4MB I/O chunks (never load a whole file)
+# CPython's sqlite is built with SQLITE_MAX_LENGTH=1e9 (~954 MiB) per BLOB.
+# Stay 1 MiB under the hard cap; a 17 GiB file is then ~18 blobs.
+_BLOB_CHUNK = 1_000_000_000 - 1024 * 1024
 
 
 @dataclass
@@ -145,14 +161,7 @@ def add_benchmark(con: sqlite3.Connection, source_root: str, benchmark: str) -> 
             size = os.path.getsize(full_path)
             mtime = os.path.getmtime(full_path)
 
-            exists = con.execute("SELECT 1 FROM blobs WHERE hash = ?", (digest,)).fetchone()
-            if exists is None:
-                with open(full_path, "rb") as f:
-                    data = f.read()
-                con.execute(
-                    "INSERT INTO blobs (hash, size, data) VALUES (?, ?, ?)",
-                    (digest, size, data),
-                )
+            if _ensure_blob(con, digest, full_path, size):
                 n_new_blobs += 1
                 new_bytes += size
 
@@ -194,18 +203,125 @@ def _walk_roots(roots: list[tuple[str, str]]) -> dict[str, tuple[str, float, str
     return found
 
 
+def _copy_file_to_blob(src, dest, size: int | None = None) -> None:
+    """Copy ``src`` to ``dest`` in chunks. Both are file-like."""
+    remaining = size
+    while remaining is None or remaining > 0:
+        n = _HASH_CHUNK if remaining is None else min(_HASH_CHUNK, remaining)
+        chunk = src.read(n)
+        if not chunk:
+            break
+        dest.write(chunk)
+        if remaining is not None:
+            remaining -= len(chunk)
+
+
+def _insert_blob_from_file(con: sqlite3.Connection, digest: str, full_path: str, size: int) -> None:
+    """Store a file as a blob without loading it into RAM."""
+    con.execute(
+        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(?))",
+        (digest, size, size),
+    )
+    (rowid,) = con.execute("SELECT rowid FROM blobs WHERE hash = ?", (digest,)).fetchone()
+    with open(full_path, "rb") as src, con.blobopen("blobs", "data", rowid) as dest:
+        _copy_file_to_blob(src, dest, size)
+
+
+def _extract_blob_to_file(con: sqlite3.Connection, digest: str, dest_path: str) -> None:
+    """Write one blobs.data row to disk without loading it into RAM."""
+    row = con.execute("SELECT rowid FROM blobs WHERE hash = ?", (digest,)).fetchone()
+    if row is None:
+        raise KeyError(f"blob {digest} not found")
+    tmp_path = dest_path + ".tmp"
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    with con.blobopen("blobs", "data", row[0], readonly=True) as src, open(tmp_path, "wb") as dest:
+        _copy_file_to_blob(src, dest)
+    os.replace(tmp_path, dest_path)
+
+
+def _chunk_hashes(con: sqlite3.Connection, digest: str) -> list[str]:
+    return [
+        row[0]
+        for row in con.execute(
+            "SELECT chunk_hash FROM file_chunks WHERE hash = ? ORDER BY seq",
+            (digest,),
+        )
+    ]
+
+
+def _extract_file_to_path(con: sqlite3.Connection, digest: str, dest_path: str) -> None:
+    """Reassemble a (possibly chunked) file onto disk."""
+    parts = _chunk_hashes(con, digest)
+    if not parts:
+        _extract_blob_to_file(con, digest, dest_path)
+        return
+
+    tmp_path = dest_path + ".tmp"
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    with open(tmp_path, "wb") as dest:
+        for chunk_hash in parts:
+            row = con.execute(
+                "SELECT rowid FROM blobs WHERE hash = ?", (chunk_hash,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"chunk {chunk_hash} not found")
+            with con.blobopen("blobs", "data", row[0], readonly=True) as src:
+                _copy_file_to_blob(src, dest)
+    os.replace(tmp_path, dest_path)
+
+
+def _insert_chunked_file(
+    con: sqlite3.Connection, digest: str, full_path: str, size: int
+) -> int:
+    """Store a large file as ordered chunk blobs. Returns new blob bytes."""
+    con.execute(
+        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(0))",
+        (digest, size),
+    )
+    new_bytes = 0
+    seq = 0
+    with open(full_path, "rb") as src:
+        while True:
+            hasher = hashlib.sha256()
+            fd, tmp_path = tempfile.mkstemp(prefix="cherrybin-chunk-")
+            try:
+                copied = 0
+                with os.fdopen(fd, "wb") as tmp:
+                    while copied < _BLOB_CHUNK:
+                        buf = src.read(min(_HASH_CHUNK, _BLOB_CHUNK - copied))
+                        if not buf:
+                            break
+                        hasher.update(buf)
+                        tmp.write(buf)
+                        copied += len(buf)
+                if copied == 0:
+                    break
+                chunk_hash = hasher.hexdigest()
+                if con.execute("SELECT 1 FROM blobs WHERE hash = ?", (chunk_hash,)).fetchone() is None:
+                    _insert_blob_from_file(con, chunk_hash, tmp_path, copied)
+                    new_bytes += copied
+                con.execute(
+                    "INSERT INTO file_chunks (hash, seq, chunk_hash) VALUES (?, ?, ?)",
+                    (digest, seq, chunk_hash),
+                )
+                seq += 1
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+    return new_bytes
+
+
 def _ensure_blob(con: sqlite3.Connection, digest: str, full_path: str, size: int) -> int:
-    """Insert the blob if missing. Returns bytes written (0 if already present)."""
+    """Insert the file if missing. Returns bytes of new blob data written."""
     exists = con.execute("SELECT 1 FROM blobs WHERE hash = ?", (digest,)).fetchone()
     if exists is not None:
         return 0
-    with open(full_path, "rb") as f:
-        data = f.read()
-    con.execute(
-        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, ?)",
-        (digest, size, data),
-    )
-    return size
+    if size <= _BLOB_CHUNK:
+        _insert_blob_from_file(con, digest, full_path, size)
+        return size
+    return _insert_chunked_file(con, digest, full_path, size)
 
 
 def index_roots(
@@ -282,8 +398,15 @@ def remove_benchmark(con: sqlite3.Connection, benchmark: str) -> int:
 
 def gc_unreferenced_blobs(con: sqlite3.Connection) -> int:
     """Remove blobs no longer referenced by any benchmark, then VACUUM."""
+    con.execute(
+        "DELETE FROM file_chunks WHERE hash NOT IN "
+        "(SELECT DISTINCT hash FROM benchmark_files)"
+    )
     cur = con.execute(
-        "DELETE FROM blobs WHERE hash NOT IN (SELECT DISTINCT hash FROM benchmark_files)"
+        "DELETE FROM blobs WHERE hash NOT IN ("
+        "SELECT hash FROM benchmark_files "
+        "UNION "
+        "SELECT chunk_hash FROM file_chunks)"
     )
     con.commit()
     removed = cur.rowcount
@@ -522,14 +645,7 @@ def checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> Checkou
             os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
 
             if not os.path.exists(cache_path):
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                (data,) = con.execute(
-                    "SELECT data FROM blobs WHERE hash = ?", (digest,)
-                ).fetchone()
-                tmp_path = cache_path + ".tmp"
-                with open(tmp_path, "wb") as f:
-                    f.write(data)
-                os.replace(tmp_path, cache_path)
+                _extract_file_to_path(con, digest, cache_path)
                 n_extracted += 1
             else:
                 n_from_cache += 1
