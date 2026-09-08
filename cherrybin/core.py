@@ -43,6 +43,12 @@ from dataclasses import dataclass
 __version__ = "0.1.0"
 __author__ = "Delaunay"
 __copyright__ = "2026, Delaunay"
+
+
+def _log(msg: str) -> None:
+    """Progress line for operations (locking, copying, hashing) that have
+    no other feedback and can silently run for a long time."""
+    print(f"[cherrybin] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 __descr__ = (
     "Sqlite-backed content-addressed archive for selective checkout "
     "of large shared benchmark datasets"
@@ -221,6 +227,10 @@ def _prefixed_relpath(full_path: str, root: str, prefix: str) -> str:
 def _walk_roots(roots: list[tuple[str, str]]) -> dict[str, tuple[str, float, str, int]]:
     """Return {relpath: (digest, mtime, full_path, size)} for every file under roots."""
     found: dict[str, tuple[str, float, str, int]] = {}
+    start = time.time()
+    last_log = start
+    n_files = 0
+    n_bytes = 0
     for abs_dir, prefix in roots:
         if not os.path.isdir(abs_dir):
             continue
@@ -228,12 +238,24 @@ def _walk_roots(roots: list[tuple[str, str]]) -> dict[str, tuple[str, float, str
             for fname in files:
                 full_path = os.path.join(root, fname)
                 relpath = _prefixed_relpath(full_path, abs_dir, prefix)
+                size = os.path.getsize(full_path)
                 found[relpath] = (
                     sha256_file(full_path),
                     os.path.getmtime(full_path),
                     full_path,
-                    os.path.getsize(full_path),
+                    size,
                 )
+                n_files += 1
+                n_bytes += size
+                now = time.time()
+                if now - last_log >= 30:
+                    _log(
+                        f"hashing... {n_files} files, {n_bytes / 1e9:.1f} GB, "
+                        f"{now - start:.0f}s elapsed (current: {relpath})"
+                    )
+                    last_log = now
+    if n_files:
+        _log(f"hashed {n_files} files, {n_bytes / 1e9:.1f} GB in {time.time() - start:.0f}s")
     return found
 
 
@@ -308,11 +330,15 @@ def _extract_file_to_path(con: sqlite3.Connection, digest: str, dest_path: str) 
 def _insert_chunked_file(
     con: sqlite3.Connection, digest: str, full_path: str, size: int
 ) -> int:
-    """Store a large file as ordered chunk blobs. Returns new blob bytes."""
-    con.execute(
-        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(0))",
-        (digest, size),
-    )
+    """Store a large file as ordered chunk blobs. Returns new blob bytes.
+
+    The whole-file marker row in ``blobs`` is inserted last, once every
+    chunk it points to (via ``file_chunks``) is already in place. A caller
+    that commits per file then never leaves a committed ``blobs`` row
+    whose chunks are incomplete -- ``_ensure_blob`` treats that row's mere
+    existence as "already archived" and would otherwise skip re-indexing
+    a file that got cut off mid-write.
+    """
     new_bytes = 0
     seq = 0
     with open(full_path, "rb") as src:
@@ -345,6 +371,10 @@ def _insert_chunked_file(
                     os.unlink(tmp_path)
                 except FileNotFoundError:
                     pass
+    con.execute(
+        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(0))",
+        (digest, size),
+    )
     return new_bytes
 
 
@@ -395,6 +425,8 @@ def _index_roots(
     removed = 0
     unchanged = 0
     new_bytes = 0
+    start = time.time()
+    last_log = start
 
     for relpath, (digest, mtime, full_path, size) in new.items():
         old_hash = old.get(relpath)
@@ -416,6 +448,15 @@ def _index_roots(
                 (digest, mtime, name, relpath),
             )
         added += 1
+        # Commit per file rather than once for the whole benchmark: bounds
+        # how much WAL a huge tree piles up before it can checkpoint, and
+        # means a crash mid-benchmark only loses the file in flight
+        # instead of every file already stored.
+        con.commit()
+        now = time.time()
+        if now - last_log >= 30:
+            _log(f"'{name}': {added} files committed, {new_bytes / 1e9:.1f} GB new, {now - start:.0f}s elapsed")
+            last_log = now
 
     for relpath in old:
         if relpath not in new:
@@ -502,6 +543,8 @@ def publish_lock_path(lock_path: str, timeout: float = 600):
     """O_CREAT|O_EXCL lock at an explicit path."""
     info = f"{socket.gethostname()} pid={os.getpid()} at={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     start = time.time()
+    waited = False
+    last_log = start
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -509,7 +552,8 @@ def publish_lock_path(lock_path: str, timeout: float = 600):
             os.close(fd)
             break
         except FileExistsError:
-            if time.time() - start > timeout:
+            elapsed = time.time() - start
+            if elapsed > timeout:
                 try:
                     holder = open(lock_path).read().strip()
                 except OSError:
@@ -518,7 +562,20 @@ def publish_lock_path(lock_path: str, timeout: float = 600):
                     f"publish lock held by [{holder}] and timeout ({timeout}s) "
                     f"exceeded; remove {lock_path} manually if that process is dead"
                 )
+            if not waited:
+                try:
+                    holder = open(lock_path).read().strip()
+                except OSError:
+                    holder = "unknown"
+                _log(f"waiting for lock {lock_path} held by [{holder}]")
+                waited = True
+            elif time.time() - last_log >= 30:
+                _log(f"still waiting for lock {lock_path} ({elapsed:.0f}s elapsed)")
+                last_log = time.time()
             time.sleep(2)
+
+    if waited:
+        _log(f"acquired lock {lock_path} after {time.time() - start:.0f}s")
 
     try:
         yield
@@ -597,18 +654,26 @@ def update_files(
         with tempfile.TemporaryDirectory() as tmp:
             local = os.path.join(tmp, "local.db")
             if existed:
+                size_gb = os.path.getsize(shared_db) / 1e9
+                _log(f"copying existing archive ({size_gb:.1f} GB) {shared_db} -> {local}")
+                t0 = time.time()
                 shutil.copyfile(shared_db, local)
+                _log(f"copy done in {time.time() - t0:.0f}s")
 
             con = connect_writable(local)
             stats = []
             try:
                 for name, roots in items:
+                    _log(f"indexing '{name}'...")
+                    t0 = time.time()
                     stats.append(index_roots(con, name, roots, io_chunk=io_chunk))
+                    _log(f"indexed '{name}' in {time.time() - t0:.0f}s")
             finally:
                 _checkpoint_and_close(con)
 
             any_changed = any(s.changed for s in stats)
             if any_changed or not existed:
+                _log(f"publishing updated archive -> {shared_db}")
                 replace_file(local, shared_db)
 
     return stats
