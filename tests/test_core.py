@@ -7,11 +7,13 @@ import pytest
 from cherrybin.core import (
     add_benchmark,
     checkout,
+    checkout_benchmarks,
     connect_writable,
     gc_unreferenced_blobs,
     index_roots,
     list_benchmarks,
     list_files,
+    open_readonly,
     publish,
     remove_benchmark,
     resolve_blob_file,
@@ -19,6 +21,8 @@ from cherrybin.core import (
     update_file,
     update_files,
     using_io_chunk,
+    _checkout_plan,
+    _merge_contiguous_ranges,
 )
 
 
@@ -500,3 +504,161 @@ def test_update_files_two_benchmarks(tmp_path):
     )
     assert [s.name for s in stats] == ["aa", "bb"]
     assert {s.name for s in list_benchmarks(connect_writable(shared))} == {"aa", "bb"}
+
+
+def test_merge_contiguous_ranges_adjacent():
+    assert _merge_contiguous_ranges([(0, 10), (10, 5)]) == [(0, 15)]
+
+
+def test_merge_contiguous_ranges_gap():
+    assert _merge_contiguous_ranges([(0, 10), (20, 5)]) == [(0, 10), (20, 25)]
+
+
+def test_checkout_plan_sorted_by_offset(tmp_path, source_tree):
+    db_path = build_local_db(tmp_path, source_tree)
+    con = open_readonly(db_path)
+    try:
+        plan = _checkout_plan(con, benchmark="bench_a")
+    finally:
+        con.close()
+    offsets = [entry.offset for entry in plan]
+    assert offsets == sorted(offsets)
+
+
+def test_checkout_stream_vs_naive_identical(tmp_path, source_tree):
+    db_path = build_local_db(tmp_path, source_tree)
+    stream_dest = str(tmp_path / "stream")
+    naive_dest = str(tmp_path / "naive")
+    checkout(db_path, "bench_a", stream_dest, str(tmp_path / "cache_s"), stream=True)
+    checkout(db_path, "bench_a", naive_dest, str(tmp_path / "cache_n"), stream=False)
+
+    for name in ("common.bin", "a_only.bin"):
+        stream_path = os.path.join(stream_dest, name)
+        naive_path = os.path.join(naive_dest, name)
+        assert open(stream_path, "rb").read() == open(naive_path, "rb").read()
+
+
+def test_checkout_benchmarks_single_pass(tmp_path, source_tree):
+    db_path = build_local_db(tmp_path, source_tree)
+    dest = str(tmp_path / "out")
+    cache = str(tmp_path / "cache")
+
+    results = checkout_benchmarks(
+        db_path, ["bench_a", "bench_b"], dest, cache, stream=True
+    )
+    assert {r.benchmark for r in results} == {"bench_a", "bench_b"}
+    assert results[0].chunks_read >= 1
+    assert os.path.exists(os.path.join(dest, "bench_a", "common.bin"))
+    assert os.path.exists(os.path.join(dest, "bench_b", "b_only.bin"))
+
+
+def test_checkout_stream_uses_fewer_seeks(tmp_path, source_tree, monkeypatch):
+    db_path = build_local_db(tmp_path, source_tree)
+    blob_path = resolve_blob_file(db_path)
+    seeks: list[int] = []
+    real_open = open
+
+    class SeekSpy:
+        def __init__(self, f):
+            self._f = f
+
+        def read(self, n=-1):
+            return self._f.read(n)
+
+        def seek(self, offset, whence=0):
+            seeks.append(offset)
+            return self._f.seek(offset, whence)
+
+        def fileno(self):
+            return self._f.fileno()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._f.close()
+
+    def spy_open(path, mode="r", *args, **kwargs):
+        f = real_open(path, mode, *args, **kwargs)
+        if os.path.abspath(path) == os.path.abspath(blob_path) and "b" in mode:
+            return SeekSpy(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", spy_open)
+
+    checkout(db_path, "bench_a", str(tmp_path / "out"), str(tmp_path / "cache"), stream=True)
+    stream_seeks = len(seeks)
+
+    seeks.clear()
+    checkout(
+        db_path,
+        "bench_b",
+        str(tmp_path / "out2"),
+        str(tmp_path / "cache"),
+        stream=False,
+    )
+    naive_seeks = len(seeks)
+
+    assert stream_seeks <= naive_seeks
+
+
+def test_checkout_stream_writer_failure_does_not_deadlock(tmp_path, monkeypatch):
+    """A writer-side failure must surface as an exception, not hang.
+
+    With a 1-slot queue and a tiny io_chunk, the reader is guaranteed to
+    still be pushing blocks (blocked on a full queue) at the moment the
+    writer dies on the first blob -- exactly the state that used to make
+    the reader's plain ``queue.put()`` block forever with no consumer
+    left, hanging the whole checkout with no error ever raised.
+    """
+    import threading
+
+    import cherrybin.core as core
+
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    for i in range(5):
+        (src / f"f{i}.bin").write_bytes(os.urandom(4096))
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
+    con.close()
+
+    con = open_readonly(db_path)
+    plan = _checkout_plan(con, benchmark="bench")
+    con.close()
+    pending = sorted(
+        (
+            core.PendingBlob(hash=e.hash, offset=e.offset, size=e.size, dest_paths=[])
+            for e in plan
+        ),
+        key=lambda p: p.offset,
+    )
+
+    monkeypatch.setattr(
+        core,
+        "_write_cache_atomically",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated disk failure")),
+    )
+
+    result: dict = {}
+
+    def run():
+        try:
+            core._stream_checkout_pending(
+                resolve_blob_file(db_path),
+                pending,
+                str(tmp_path / "cache"),
+                io_chunk=16,
+                queue_depth=1,
+            )
+        except BaseException as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive(), "checkout streaming deadlocked instead of raising"
+    assert "simulated disk failure" in str(result.get("error"))

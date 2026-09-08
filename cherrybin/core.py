@@ -32,9 +32,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import queue
 import shutil
 import socket
 import sqlite3
+import threading
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -116,6 +118,7 @@ CREATE TABLE IF NOT EXISTS meta (
 # Default stream size for hashing / blob copy. Override via ``io_chunk=``
 # on the public APIs or ``--io-chunk`` on the CLI (bytes).
 DEFAULT_IO_CHUNK = 4 * 1024 * 1024
+DEFAULT_STREAM_QUEUE_DEPTH = 8
 _HASH_CHUNK = DEFAULT_IO_CHUNK
 
 _io_chunk: ContextVar[int | None] = ContextVar("cherrybin_io_chunk", default=None)
@@ -828,13 +831,451 @@ def open_readonly(db_path: str) -> sqlite3.Connection:
 
 
 @dataclass
+class CheckoutFile:
+    """One benchmark file entry with blob location in the append-only payload."""
+
+    benchmark: str
+    relpath: str
+    hash: str
+    offset: int
+    size: int
+
+
+@dataclass
+class PendingBlob:
+    """One unique blob still to read from the archive."""
+
+    hash: str
+    offset: int
+    size: int
+    dest_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CheckoutResult:
     benchmark: str
     dest: str
     file_count: int
     pulled_from_archive: int
     already_cached: int
+    chunks_read: int = 0
+    archive_bytes_read: int = 0
     io: IoStats = field(default_factory=IoStats)
+
+
+def _checkout_plan(
+    con: sqlite3.Connection,
+    *,
+    benchmark: str | None = None,
+    benchmarks: list[str] | None = None,
+) -> list[CheckoutFile]:
+    if benchmark is not None:
+        rows = con.execute(
+            "SELECT bf.benchmark, bf.relpath, b.hash, b.offset, b.size "
+            "FROM benchmark_files bf "
+            "JOIN blobs b ON b.hash = bf.hash "
+            "WHERE bf.benchmark = ? "
+            "ORDER BY b.offset, bf.relpath",
+            (benchmark,),
+        ).fetchall()
+    elif benchmarks is not None:
+        if not benchmarks:
+            return []
+        placeholders = ",".join("?" * len(benchmarks))
+        rows = con.execute(
+            f"SELECT bf.benchmark, bf.relpath, b.hash, b.offset, b.size "
+            f"FROM benchmark_files bf "
+            f"JOIN blobs b ON b.hash = bf.hash "
+            f"WHERE bf.benchmark IN ({placeholders}) "
+            f"ORDER BY b.offset, bf.benchmark, bf.relpath",
+            benchmarks,
+        ).fetchall()
+    else:
+        raise ValueError("pass benchmark or benchmarks")
+
+    plan: list[CheckoutFile] = []
+    for bench, relpath, digest, offset, size in rows:
+        if offset is None:
+            raise KeyError(f"blob {digest} has no offset")
+        plan.append(
+            CheckoutFile(
+                benchmark=bench,
+                relpath=relpath,
+                hash=digest,
+                offset=offset,
+                size=size,
+            )
+        )
+    return plan
+
+
+def _merge_contiguous_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge ``(offset, size)`` into half-open ``(start, end)`` spans."""
+    if not ranges:
+        return []
+    merged: list[tuple[int, int]] = []
+    start, end = ranges[0][0], ranges[0][0] + ranges[0][1]
+    for offset, size in ranges[1:]:
+        if offset == end:
+            end = offset + size
+        else:
+            merged.append((start, end))
+            start, end = offset, offset + size
+    merged.append((start, end))
+    return merged
+
+
+def _dest_path(dest_root: str, entry: CheckoutFile, *, nest_benchmark: bool = False) -> str:
+    if nest_benchmark:
+        return os.path.join(dest_root, entry.benchmark, entry.relpath)
+    return os.path.join(dest_root, entry.relpath)
+
+
+def _cache_path(cache_dir: str, digest: str) -> str:
+    return os.path.join(cache_dir, digest[:2], digest)
+
+
+def _fadvise_willneed(fd: int, offset: int, length: int) -> None:
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_WILLNEED)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _write_cache_atomically(cache_path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    tmp_path = cache_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+    os.replace(tmp_path, cache_path)
+
+
+def _split_cached_and_pending(
+    plan: list[CheckoutFile],
+    dest_root: str,
+    cache_dir: str,
+    *,
+    nest_benchmark: bool = False,
+) -> tuple[int, list[PendingBlob]]:
+    """Hardlink cached blobs to dest; return pending unique hashes to read."""
+    already_cached = 0
+    pending_by_hash: dict[str, PendingBlob] = {}
+
+    for entry in plan:
+        dest_path = _dest_path(dest_root, entry, nest_benchmark=nest_benchmark)
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        cache = _cache_path(cache_dir, entry.hash)
+
+        if os.path.exists(cache):
+            link_or_copy(cache, dest_path)
+            already_cached += 1
+        elif entry.hash in pending_by_hash:
+            pending_by_hash[entry.hash].dest_paths.append(dest_path)
+        else:
+            pending_by_hash[entry.hash] = PendingBlob(
+                hash=entry.hash,
+                offset=entry.offset,
+                size=entry.size,
+                dest_paths=[dest_path],
+            )
+
+    pending = sorted(pending_by_hash.values(), key=lambda p: p.offset)
+    return already_cached, pending
+
+
+_STOPPED = object()  # sentinel: the other thread already failed, give up
+
+
+def _queue_put_cancelable(
+    q: queue.Queue, item, stop_event: threading.Event, poll: float = 0.5
+) -> bool:
+    """``q.put(item)`` that gives up once ``stop_event`` fires, instead of
+    blocking forever on a full queue nobody is draining anymore. Returns
+    False if it gave up."""
+    while not stop_event.is_set():
+        try:
+            q.put(item, timeout=poll)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _queue_get_cancelable(q: queue.Queue, stop_event: threading.Event, poll: float = 0.5):
+    """``q.get()`` that returns ``_STOPPED`` once ``stop_event`` fires, instead
+    of blocking forever on an empty queue nobody is filling anymore."""
+    while not stop_event.is_set():
+        try:
+            return q.get(timeout=poll)
+        except queue.Empty:
+            continue
+    return _STOPPED
+
+
+def _stream_blob_reader(
+    blob_path: str,
+    chunks: list[tuple[int, int]],
+    block_queue: queue.Queue,
+    error: list[BaseException | None],
+    stop_event: threading.Event,
+    *,
+    io_chunk: int,
+    stats: IoStats | None,
+) -> None:
+    """Read merged blob spans into ``block_queue`` for the writer thread.
+
+    Every wait on the queue is bounded by ``stop_event`` (see
+    ``_queue_put_cancelable``): if the writer has already failed and
+    stopped draining, this returns instead of blocking on a full queue
+    forever -- a plain ``queue.put()`` here could deadlock the whole
+    checkout on the writer's error path, silently, with no exception
+    ever reaching the caller.
+    """
+    try:
+        with open(blob_path, "rb") as blob:
+            pos = 0
+            for start, end in chunks:
+                if pos != start:
+                    blob.seek(start)
+                    pos = start
+                span = end - start
+                _fadvise_willneed(blob.fileno(), start, span)
+                remaining = span
+                while remaining > 0:
+                    t0 = time.perf_counter()
+                    block = blob.read(min(io_chunk, remaining))
+                    elapsed = time.perf_counter() - t0
+                    if not block:
+                        raise OSError(
+                            f"unexpected EOF in {blob_path} at offset {pos}"
+                        )
+                    _record_io_to(stats, "read", len(block), elapsed)
+                    if not _queue_put_cancelable(block_queue, block, stop_event):
+                        return  # writer already failed; nothing left to do
+                    pos += len(block)
+                    remaining -= len(block)
+        _queue_put_cancelable(block_queue, None, stop_event)
+    except BaseException as exc:
+        if error[0] is None:  # keep the first, most informative failure
+            error[0] = exc
+        stop_event.set()
+
+
+def _stream_blob_writer(
+    pending: list[PendingBlob],
+    cache_dir: str,
+    block_queue: queue.Queue,
+    error: list[BaseException | None],
+    stop_event: threading.Event,
+    *,
+    stats: IoStats | None,
+) -> None:
+    """Consume ``block_queue`` and materialize each pending blob to cache.
+
+    See ``_stream_blob_reader`` for why every queue wait is bounded by
+    ``stop_event`` rather than blocking indefinitely.
+    """
+    try:
+        buf = bytearray()
+        for blob in pending:
+            while len(buf) < blob.size:
+                block = _queue_get_cancelable(block_queue, stop_event)
+                if block is _STOPPED:
+                    return  # reader already failed; nothing left to consume
+                if block is None:
+                    raise OSError("unexpected end of blob stream")
+                buf.extend(block)
+
+            payload = bytes(buf[: blob.size])
+            del buf[: blob.size]
+
+            cache = _cache_path(cache_dir, blob.hash)
+            t0 = time.perf_counter()
+            _write_cache_atomically(cache, payload)
+            _record_io_to(stats, "write", len(payload), time.perf_counter() - t0)
+
+            for dest_path in blob.dest_paths:
+                link_or_copy(cache, dest_path)
+
+        sentinel = _queue_get_cancelable(block_queue, stop_event)
+        if sentinel is not _STOPPED and sentinel is not None:
+            raise OSError("trailing data after blob stream")
+    except BaseException as exc:
+        if error[0] is None:
+            error[0] = exc
+        stop_event.set()
+
+
+def _record_io_to(
+    stats: IoStats | None,
+    op: Literal["read", "write"],
+    nbytes: int,
+    elapsed: float,
+) -> None:
+    if stats is None or nbytes <= 0 or elapsed < 0:
+        return
+    if op == "read":
+        stats.read_bytes += nbytes
+        stats.read_seconds += elapsed
+    else:
+        stats.write_bytes += nbytes
+        stats.write_seconds += elapsed
+
+
+def _stream_checkout_pending(
+    blob_path: str,
+    pending: list[PendingBlob],
+    cache_dir: str,
+    *,
+    io_chunk: int | None = None,
+    queue_depth: int = DEFAULT_STREAM_QUEUE_DEPTH,
+    stats: IoStats | None = None,
+) -> tuple[int, int]:
+    """Read merged blob spans and materialize ``pending`` into cache + dest."""
+    if not pending:
+        return 0, 0
+
+    chunk_size = io_chunk if io_chunk is not None else _current_io_chunk()
+    ranges = [(p.offset, p.size) for p in pending]
+    chunks = _merge_contiguous_ranges(ranges)
+    archive_bytes = sum(end - start for start, end in chunks)
+    _log(
+        f"streaming {len(chunks)} chunk(s), {_format_size(archive_bytes)} "
+        f"from {blob_path}"
+    )
+
+    block_queue: queue.Queue = queue.Queue(maxsize=queue_depth)
+    error: list[BaseException | None] = [None]
+    stop_event = threading.Event()
+
+    reader = threading.Thread(
+        target=_stream_blob_reader,
+        args=(blob_path, chunks, block_queue, error, stop_event),
+        kwargs={"io_chunk": chunk_size, "stats": stats},
+        daemon=True,
+    )
+    writer = threading.Thread(
+        target=_stream_blob_writer,
+        args=(pending, cache_dir, block_queue, error, stop_event),
+        kwargs={"stats": stats},
+        daemon=True,
+    )
+    reader.start()
+    writer.start()
+    reader.join()
+    writer.join()
+
+    if error[0] is not None:
+        raise error[0]
+    return len(chunks), archive_bytes
+
+
+def _checkout_stream(
+    con: sqlite3.Connection,
+    db_path: str,
+    plan: list[CheckoutFile],
+    dest_root: str,
+    cache_dir: str,
+    *,
+    nest_benchmark: bool = False,
+) -> tuple[int, int, int, int]:
+    if not plan:
+        return 0, 0, 0, 0
+
+    os.makedirs(dest_root, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    already_cached, pending = _split_cached_and_pending(
+        plan, dest_root, cache_dir, nest_benchmark=nest_benchmark
+    )
+    pulled = len(pending)
+    chunks_read, archive_bytes = _stream_checkout_pending(
+        resolve_blob_file(db_path),
+        pending,
+        cache_dir,
+        io_chunk=_current_io_chunk(),
+        stats=_io_stats.get(),
+    )
+    return already_cached, pulled, chunks_read, archive_bytes
+
+
+def _checkout_naive(
+    con: sqlite3.Connection,
+    db_path: str,
+    plan: list[CheckoutFile],
+    dest_root: str,
+    cache_dir: str,
+    *,
+    nest_benchmark: bool = False,
+) -> tuple[int, int, int, int]:
+    if not plan:
+        return 0, 0, 0, 0
+
+    os.makedirs(dest_root, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    n_from_cache = 0
+    n_extracted = 0
+
+    for entry in plan:
+        dest_path = _dest_path(dest_root, entry, nest_benchmark=nest_benchmark)
+        cache = _cache_path(cache_dir, entry.hash)
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+
+        if not os.path.exists(cache):
+            _extract_file_to_path(con, entry.hash, cache, db_path=db_path)
+            n_extracted += 1
+        else:
+            n_from_cache += 1
+
+        link_or_copy(cache, dest_path)
+
+    return n_from_cache, n_extracted, 0, 0
+
+
+def _results_for_benchmarks(
+    plan: list[CheckoutFile],
+    dest_root: str,
+    *,
+    already_cached: int,
+    pulled: int,
+    chunks_read: int,
+    archive_bytes: int,
+    benchmarks: list[str] | None = None,
+) -> list[CheckoutResult]:
+    if benchmarks is None:
+        benchmarks = sorted({entry.benchmark for entry in plan})
+
+    per_bench_files: dict[str, int] = {}
+    for entry in plan:
+        per_bench_files[entry.benchmark] = per_bench_files.get(entry.benchmark, 0) + 1
+
+    if len(benchmarks) == 1:
+        bench = benchmarks[0]
+        return [
+            CheckoutResult(
+                benchmark=bench,
+                dest=dest_root,
+                file_count=per_bench_files.get(bench, 0),
+                pulled_from_archive=pulled,
+                already_cached=already_cached,
+                chunks_read=chunks_read,
+                archive_bytes_read=archive_bytes,
+            )
+        ]
+
+    return [
+        CheckoutResult(
+            benchmark=bench,
+            dest=os.path.join(dest_root, bench),
+            file_count=per_bench_files.get(bench, 0),
+            pulled_from_archive=0,
+            already_cached=0,
+            chunks_read=0,
+            archive_bytes_read=0,
+        )
+        for bench in benchmarks
+    ]
 
 
 def checkout(
@@ -844,50 +1285,106 @@ def checkout(
     cache_dir: str,
     *,
     io_chunk: int | None = None,
+    stream: bool = True,
 ) -> CheckoutResult:
     with using_io_chunk(io_chunk):
         with tracking_io_stats() as io:
-            result = _checkout(db_path, benchmark, dest, cache_dir)
-            result.io = io
-            return result
+            con = open_readonly(db_path)
+            try:
+                plan = _checkout_plan(con, benchmark=benchmark)
+                if not plan:
+                    raise KeyError(
+                        f"no files found for benchmark '{benchmark}' in {db_path}"
+                    )
+
+                if stream:
+                    _log(f"stream checkout '{benchmark}'")
+                    stats = _checkout_stream(con, db_path, plan, dest, cache_dir)
+                else:
+                    _log(f"naive checkout '{benchmark}'")
+                    stats = _checkout_naive(con, db_path, plan, dest, cache_dir)
+
+                result = _results_for_benchmarks(
+                    plan,
+                    dest,
+                    already_cached=stats[0],
+                    pulled=stats[1],
+                    chunks_read=stats[2],
+                    archive_bytes=stats[3],
+                )[0]
+                result.io = io
+                return result
+            finally:
+                con.close()
 
 
-def _checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> CheckoutResult:
-    con = open_readonly(db_path)
-    try:
-        rows = con.execute(
-            "SELECT relpath, hash FROM benchmark_files WHERE benchmark = ? ORDER BY hash",
-            (benchmark,),
-        ).fetchall()
+def checkout_benchmarks(
+    db_path: str,
+    benchmarks: list[str],
+    dest_root: str,
+    cache_dir: str,
+    *,
+    io_chunk: int | None = None,
+    stream: bool = True,
+) -> list[CheckoutResult]:
+    """Materialize multiple benchmarks with one blob read pass when streaming."""
+    benchmarks = sorted(set(benchmarks))
+    with using_io_chunk(io_chunk):
+        with tracking_io_stats() as io:
+            con = open_readonly(db_path)
+            try:
+                plan = _checkout_plan(con, benchmarks=benchmarks)
+                if not plan:
+                    raise KeyError(
+                        f"no files found for benchmarks {benchmarks} in {db_path}"
+                    )
 
-        if not rows:
-            raise KeyError(f"no files found for benchmark '{benchmark}' in {db_path}")
+                if stream:
+                    _log(
+                        f"full archive stream checkout "
+                        f"({len(benchmarks)} benchmarks, {len(plan)} files)"
+                    )
+                    stats = _checkout_stream(
+                        con, db_path, plan, dest_root, cache_dir, nest_benchmark=True
+                    )
+                else:
+                    _log(
+                        f"full archive naive checkout "
+                        f"({len(benchmarks)} benchmarks)"
+                    )
+                    total_cached = 0
+                    total_pulled = 0
+                    for bench in benchmarks:
+                        bench_plan = [e for e in plan if e.benchmark == bench]
+                        bench_dest = os.path.join(dest_root, bench)
+                        c, p, _, _ = _checkout_naive(
+                            con,
+                            db_path,
+                            bench_plan,
+                            bench_dest,
+                            cache_dir,
+                            nest_benchmark=False,
+                        )
+                        total_cached += c
+                        total_pulled += p
+                    stats = (total_cached, total_pulled, 0, 0)
 
-        os.makedirs(dest, exist_ok=True)
-        os.makedirs(cache_dir, exist_ok=True)
-
-        n_from_cache = 0
-        n_extracted = 0
-
-        for relpath, digest in rows:
-            cache_path = os.path.join(cache_dir, digest[:2], digest)
-            dest_path = os.path.join(dest, relpath)
-            os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-
-            if not os.path.exists(cache_path):
-                _extract_file_to_path(con, digest, cache_path, db_path=db_path)
-                n_extracted += 1
-            else:
-                n_from_cache += 1
-
-            link_or_copy(cache_path, dest_path)
-
-        return CheckoutResult(
-            benchmark=benchmark,
-            dest=dest,
-            file_count=len(rows),
-            pulled_from_archive=n_extracted,
-            already_cached=n_from_cache,
-        )
-    finally:
-        con.close()
+                results = _results_for_benchmarks(
+                    plan,
+                    dest_root,
+                    already_cached=stats[0],
+                    pulled=stats[1],
+                    chunks_read=stats[2],
+                    archive_bytes=stats[3],
+                    benchmarks=benchmarks,
+                )
+                if len(benchmarks) > 1 and stream:
+                    results[0].chunks_read = stats[2]
+                    results[0].archive_bytes_read = stats[3]
+                    results[0].pulled_from_archive = stats[1]
+                    results[0].already_cached = stats[0]
+                for result in results:
+                    result.io = io
+                return results
+            finally:
+                con.close()

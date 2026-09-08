@@ -18,6 +18,7 @@ class Arguments:
     db: str = ""
     shared_dir: str = ""
     io_chunk: int = DEFAULT_IO_CHUNK
+    no_stream: bool = False
 
 
 class Checkout(Command):
@@ -47,16 +48,24 @@ class Checkout(Command):
 
         try:
             result = checkout(
-                db_path, args.benchmark, args.dest, args.cache, io_chunk=args.io_chunk
+                db_path,
+                args.benchmark,
+                args.dest,
+                args.cache,
+                io_chunk=args.io_chunk,
+                stream=not args.no_stream,
             )
         except (FileNotFoundError, KeyError) as e:
             print(f"error: {e}")
             return 1
 
+        mode = "stream" if not args.no_stream else "naive"
         print(
             f"[{result.benchmark}] {result.file_count} files -> {result.dest} "
             f"({result.pulled_from_archive} pulled from archive, "
-            f"{result.already_cached} already cached), "
+            f"{result.already_cached} already cached, "
+            f"{result.chunks_read} chunks, "
+            f"{result.archive_bytes_read / 1e6:.1f} MB read, {mode}), "
             f"{result.io.summary()}"
         )
         return 0
