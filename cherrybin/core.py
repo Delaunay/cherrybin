@@ -226,6 +226,19 @@ class IndexStats:
     def changed(self) -> bool:
         return self.added > 0 or self.removed > 0
 
+    @property
+    def new_blobs(self) -> int:
+        """Files whose content was newly appended to the blob file."""
+        return self.added - self.deduped
+
+    def summary(self) -> str:
+        return (
+            f"{self.file_count} files "
+            f"(+{self.new_blobs} new, {self.deduped} deduped, "
+            f"-{self.removed} removed, ={self.unchanged} unchanged, "
+            f"{_format_size(self.new_bytes)} payload)"
+        )
+
 
 def sha256_file(path: str, *, io_chunk: int | None = None) -> str:
     with using_io_chunk(io_chunk):
@@ -554,8 +567,8 @@ def _index_roots(
         con.commit()
         if added or removed:
             _log(
-                f"'{name}': {added} file entries, "
-                f"{new_bytes / 1e9:.1f} GB new blobs, {deduped} deduped"
+                f"'{name}': {added - deduped} new, {deduped} deduped, "
+                f"{_format_size(new_bytes)} payload"
             )
         return IndexStats(
             name=name,
