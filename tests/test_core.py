@@ -15,7 +15,6 @@ from cherrybin.core import (
     publish,
     remove_benchmark,
     resolve_blob_file,
-    resolve_blobs_dir,
     resolve_current,
     update_file,
     update_files,
@@ -25,10 +24,9 @@ from cherrybin.core import (
 
 def build_local_db(tmp_path, source_tree):
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     con = connect_writable(db_path)
-    add_benchmark(con, source_tree, "bench_a", blobs_dir=blobs_dir)
-    add_benchmark(con, source_tree, "bench_b", blobs_dir=blobs_dir)
+    add_benchmark(con, source_tree, "bench_a", db_path=db_path)
+    add_benchmark(con, source_tree, "bench_b", db_path=db_path)
     con.close()
     return db_path
 
@@ -60,7 +58,7 @@ def test_dedup_stores_shared_blob_once(tmp_path, source_tree):
     assert n_blobs == 3
 
 
-def test_checkout_streams_blob_larger_than_chunk(tmp_path, monkeypatch):
+def test_checkout_streams_large_file(tmp_path, monkeypatch):
     import cherrybin.core as core
 
     monkeypatch.setattr(core, "_HASH_CHUNK", 16)
@@ -71,7 +69,7 @@ def test_checkout_streams_blob_larger_than_chunk(tmp_path, monkeypatch):
 
     db_path = str(tmp_path / "local.db")
     con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench")
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
     con.close()
 
     dest = str(tmp_path / "out")
@@ -96,9 +94,8 @@ def test_io_chunk_kwarg_overrides_default(tmp_path, monkeypatch):
     (src / "a.bin").write_bytes(b"x" * 64)
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench", io_chunk=16, blobs_dir=blobs_dir)
+    add_benchmark(con, str(tmp_path / "src"), "bench", io_chunk=16, db_path=db_path)
     con.close()
 
     checkout(db_path, "bench", str(tmp_path / "out"), str(tmp_path / "cache"), io_chunk=32)
@@ -170,7 +167,7 @@ def test_remove_then_gc_reclaims_unreferenced_blob(tmp_path, source_tree):
 
     remove_benchmark(con, "bench_a")
     n_blobs_before = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-    removed = gc_unreferenced_blobs(con, blobs_dir=resolve_blobs_dir(db_path))
+    removed = gc_unreferenced_blobs(con)
     n_blobs_after = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
     con.close()
 
@@ -204,13 +201,12 @@ def test_index_roots_prefixes_and_incremental(tmp_path):
     _write(str(cache / "torch" / "hub.bin"), "torch")
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     con = connect_writable(db_path)
     stats = index_roots(
         con,
         "vllm",
         [(str(data), "data"), (str(cache), "cache")],
-        blobs_dir=blobs_dir,
+        db_path=db_path,
     )
     con.close()
 
@@ -229,7 +225,7 @@ def test_index_roots_prefixes_and_incremental(tmp_path):
         con,
         "vllm",
         [(str(data), "data"), (str(cache), "cache")],
-        blobs_dir=blobs_dir,
+        db_path=db_path,
     )
     assert again.added == 0
     assert again.removed == 0
@@ -243,7 +239,7 @@ def test_index_roots_prefixes_and_incremental(tmp_path):
         con,
         "vllm",
         [(str(data), "data"), (str(cache), "cache")],
-        blobs_dir=blobs_dir,
+        db_path=db_path,
     )
     con.close()
 
@@ -264,15 +260,14 @@ def test_index_roots_shared_blob_kept_when_one_bench_drops(tmp_path):
     _write(str(b / "only_b.bin"), "b")
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     con = connect_writable(db_path)
-    index_roots(con, "bench_a", [(str(a), "")], blobs_dir=blobs_dir)
-    index_roots(con, "bench_b", [(str(b), "")], blobs_dir=blobs_dir)
+    index_roots(con, "bench_a", [(str(a), "")], db_path=db_path)
+    index_roots(con, "bench_b", [(str(b), "")], db_path=db_path)
     n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
     assert n_blobs == 3
 
     os.remove(a / "only_a.bin")
-    index_roots(con, "bench_a", [(str(a), "")], blobs_dir=blobs_dir)
+    index_roots(con, "bench_a", [(str(a), "")], db_path=db_path)
     n_blobs_after = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
     con.close()
 
@@ -309,57 +304,6 @@ def test_update_file_creates_and_replaces(tmp_path):
     assert os.path.exists(os.path.join(dest, "data", "a.bin"))
 
 
-def test_chunked_file_round_trip(tmp_path, monkeypatch):
-    import cherrybin.core as core
-
-    monkeypatch.setattr(core, "_BLOB_CHUNK", 32)
-    payload = os.urandom(512)  # 512 bytes -> 16 chunks of 32
-    src = tmp_path / "src" / "bench"
-    src.mkdir(parents=True)
-    (src / "huge.bin").write_bytes(payload)
-
-    db_path = str(tmp_path / "local.db")
-    con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench")
-    n_chunks = con.execute("SELECT COUNT(*) FROM file_chunks").fetchone()[0]
-    n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-    file_hash = con.execute("SELECT hash FROM benchmark_files").fetchone()[0]
-    placeholder = con.execute(
-        "SELECT size, length(data) FROM blobs WHERE hash = ?", (file_hash,)
-    ).fetchone()
-    con.close()
-
-    assert n_chunks == 16
-    assert n_blobs >= 2  # placeholder + at least one chunk
-    assert placeholder == (512, 0)
-
-    dest = str(tmp_path / "out")
-    checkout(db_path, "bench", dest, str(tmp_path / "cache"))
-    assert open(os.path.join(dest, "huge.bin"), "rb").read() == payload
-
-
-def test_chunked_file_gc_after_remove(tmp_path, monkeypatch):
-    import cherrybin.core as core
-
-    monkeypatch.setattr(core, "_BLOB_CHUNK", 32)
-    src = tmp_path / "src" / "bench"
-    src.mkdir(parents=True)
-    (src / "huge.bin").write_bytes(b"x" * 80)
-
-    db_path = str(tmp_path / "local.db")
-    con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench")
-    remove_benchmark(con, "bench")
-    removed = gc_unreferenced_blobs(con)
-    n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
-    n_chunks = con.execute("SELECT COUNT(*) FROM file_chunks").fetchone()[0]
-    con.close()
-
-    assert removed >= 1
-    assert n_blobs == 0
-    assert n_chunks == 0
-
-
 def test_append_blob_round_trip(tmp_path):
     payload_a = b"first-file-contents"
     payload_b = b"second-file-is-longer!!"
@@ -369,10 +313,12 @@ def test_append_blob_round_trip(tmp_path):
     (src / "b.bin").write_bytes(payload_b)
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     blob_file = resolve_blob_file(db_path)
     con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench", blobs_dir=blobs_dir)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
+
+    assert os.path.isfile(blob_file)
+    assert not os.path.isdir(blob_file)
 
     rows = con.execute(
         "SELECT hash, size, offset, length(data) FROM blobs ORDER BY offset"
@@ -400,14 +346,13 @@ def test_append_blob_gc_keeps_blob_file(tmp_path):
     (src / "huge.bin").write_bytes(payload)
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     blob_file = resolve_blob_file(db_path)
     con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench", blobs_dir=blobs_dir)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
     blob_size_before = os.path.getsize(blob_file)
 
     remove_benchmark(con, "bench")
-    removed = gc_unreferenced_blobs(con, blobs_dir=blobs_dir)
+    removed = gc_unreferenced_blobs(con)
     n_blobs = con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
     con.close()
 
@@ -427,11 +372,10 @@ def test_append_blob_dedup_appends_once(tmp_path):
     (b / "shared.bin").write_bytes(payload)
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     blob_file = resolve_blob_file(db_path)
     con = connect_writable(db_path)
-    index_roots(con, "bench_a", [(str(a), "")], blobs_dir=blobs_dir)
-    index_roots(con, "bench_b", [(str(b), "")], blobs_dir=blobs_dir)
+    index_roots(con, "bench_a", [(str(a), "")], db_path=db_path)
+    index_roots(con, "bench_b", [(str(b), "")], db_path=db_path)
     rows = con.execute("SELECT COUNT(*), MIN(offset) FROM blobs").fetchone()
     con.close()
 
@@ -447,15 +391,16 @@ def test_publish_syncs_append_blob(tmp_path):
     (src / "huge.bin").write_bytes(payload)
 
     db_path = str(tmp_path / "local.db")
-    blobs_dir = resolve_blobs_dir(db_path)
     con = connect_writable(db_path)
-    add_benchmark(con, str(tmp_path / "src"), "bench", blobs_dir=blobs_dir)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
     offset = con.execute("SELECT offset FROM blobs").fetchone()[0]
     con.close()
 
     shared_dir = str(tmp_path / "shared")
     published_path = publish(db_path, shared_dir, "v1")
     published_blob = resolve_blob_file(published_path)
+
+    assert os.path.isfile(published_blob)
 
     assert _read_blob_slice(published_blob, offset, len(payload)) == payload
 
@@ -482,6 +427,64 @@ def test_update_file_appends_to_shared_blob(tmp_path):
     dest = str(tmp_path / "out")
     checkout(shared, "bench", dest, str(tmp_path / "cache"))
     assert open(os.path.join(dest, "data", "big.bin"), "rb").read() == payload
+
+
+def test_checkout_reports_read_io_stats(tmp_path):
+    payload = os.urandom(256 * 1024)
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    (src / "big.bin").write_bytes(payload)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
+    con.close()
+
+    result = checkout(db_path, "bench", str(tmp_path / "out"), str(tmp_path / "cache"))
+    assert result.pulled_from_archive == 1
+    assert result.io.read_bytes == len(payload)
+    assert result.io.read_mbps > 0
+    assert "read" in result.io.summary()
+
+
+def test_update_file_reports_write_io_stats(tmp_path):
+    payload = os.urandom(256 * 1024)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "big.bin").write_bytes(payload)
+
+    shared = str(tmp_path / "archive.db")
+    stats = update_file(shared, "bench", [(str(tree), "data")])
+    assert stats.new_bytes == len(payload)
+    assert stats.io.write_bytes == len(payload)
+    assert stats.io.write_mbps > 0
+    assert "write" in stats.io.summary()
+
+
+def test_second_benchmark_dedups_shared_blobs(tmp_path):
+    payload = os.urandom(128 * 1024)
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "shared.bin").write_bytes(payload)
+    (b / "shared.bin").write_bytes(payload)
+
+    shared = str(tmp_path / "archive.db")
+    first = update_file(shared, "bench_a", [(str(a), "")])
+    second = update_file(shared, "bench_b", [(str(b), "")])
+
+    assert first.added == 1
+    assert first.deduped == 0
+    assert first.new_bytes == len(payload)
+    assert second.added == 1
+    assert second.deduped == 1
+    assert second.new_bytes == 0
+    assert second.io.write_bytes == 0
+
+    con = connect_writable(shared)
+    assert con.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 1
+    con.close()
 
 
 def test_update_files_two_benchmarks(tmp_path):

@@ -60,9 +60,10 @@ class Update(Command):
 
         print(
             f"[{stats.name}] {stats.file_count} files "
-            f"(+{stats.added} -{stats.removed} ={stats.unchanged}) "
-            f"new_blobs={stats.new_bytes / 1e6:.1f} MB "
-            f"{'updated' if stats.changed else 'unchanged'} {args.db}"
+            f"(+{stats.added} -{stats.removed} ={stats.unchanged}, "
+            f"{stats.deduped} deduped, {stats.new_bytes / 1e6:.1f} MB new blobs) "
+            f"{'updated' if stats.changed else 'unchanged'} {args.db}, "
+            f"{stats.io.summary()}"
         )
         return 0
 

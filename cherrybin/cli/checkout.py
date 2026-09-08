@@ -56,7 +56,8 @@ class Checkout(Command):
         print(
             f"[{result.benchmark}] {result.file_count} files -> {result.dest} "
             f"({result.pulled_from_archive} pulled from archive, "
-            f"{result.already_cached} already cached)"
+            f"{result.already_cached} already cached), "
+            f"{result.io.summary()}"
         )
         return 0
 

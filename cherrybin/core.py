@@ -35,10 +35,10 @@ import os
 import shutil
 import socket
 import sqlite3
-import tempfile
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 __version__ = "0.1.0"
 __author__ = "Delaunay"
@@ -51,19 +51,33 @@ def _log(msg: str) -> None:
     print(f"[cherrybin] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
-def resolve_blobs_dir(db_path: str) -> str:
-    """Sibling directory holding the append-only blob file for this archive."""
+def resolve_blob_file(db_path: str) -> str:
+    """Append-only payload file beside the sqlite ledger (``<db>.blobs``)."""
     return os.path.abspath(db_path) + ".blobs"
 
 
-def resolve_blob_file(db_path: str) -> str:
-    """Path to the single append-only blob file beside ``db_path``."""
-    return os.path.join(resolve_blobs_dir(db_path), "data")
+def _format_size(nbytes: int) -> str:
+    if nbytes >= 1_000_000_000:
+        return f"{nbytes / 1e9:.1f} GB"
+    if nbytes >= 1_000_000:
+        return f"{nbytes / 1e6:.1f} MB"
+    if nbytes >= 1_000:
+        return f"{nbytes / 1e3:.1f} KB"
+    return f"{nbytes} B"
 
 
-def _legacy_external_blob_path(blobs_dir: str, digest: str) -> str:
-    """Per-hash external file layout kept for reading older archives."""
-    return os.path.join(blobs_dir, digest[:2], digest)
+def _archive_payload_size(db_path: str) -> int:
+    blob = resolve_blob_file(db_path)
+    return os.path.getsize(blob) if os.path.isfile(blob) else 0
+
+
+def _log_archive_sizes(db_path: str, *, prefix: str) -> None:
+    ledger = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    payload = _archive_payload_size(db_path)
+    _log(
+        f"{prefix} ledger {_format_size(ledger)}, "
+        f"blob {_format_size(payload)} ({resolve_blob_file(db_path)})"
+    )
 
 
 __descr__ = (
@@ -93,19 +107,6 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_files_benchmark
 CREATE INDEX IF NOT EXISTS idx_benchmark_files_hash
     ON benchmark_files(hash);
 
-CREATE TABLE IF NOT EXISTS file_chunks (
-    hash       TEXT NOT NULL,
-    seq        INTEGER NOT NULL,
-    chunk_hash TEXT NOT NULL REFERENCES blobs(hash),
-    PRIMARY KEY (hash, seq)
-);
-
-CREATE INDEX IF NOT EXISTS idx_file_chunks_hash
-    ON file_chunks(hash);
-
-CREATE INDEX IF NOT EXISTS idx_file_chunks_chunk
-    ON file_chunks(chunk_hash);
-
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -116,9 +117,6 @@ CREATE TABLE IF NOT EXISTS meta (
 # on the public APIs or ``--io-chunk`` on the CLI (bytes).
 DEFAULT_IO_CHUNK = 4 * 1024 * 1024
 _HASH_CHUNK = DEFAULT_IO_CHUNK
-# CPython's sqlite is built with SQLITE_MAX_LENGTH=1e9 (~954 MiB) per BLOB.
-# Stay 1 MiB under the hard cap; a 17 GiB file is then ~18 blobs.
-_BLOB_CHUNK = 1_000_000_000 - 1024 * 1024
 
 _io_chunk: ContextVar[int | None] = ContextVar("cherrybin_io_chunk", default=None)
 
@@ -144,10 +142,71 @@ def using_io_chunk(size: int | None):
 
 
 @dataclass
+class IoStats:
+    """Payload bytes moved to/from the archive during one operation."""
+
+    read_bytes: int = 0
+    write_bytes: int = 0
+    read_seconds: float = 0.0
+    write_seconds: float = 0.0
+
+    @property
+    def read_mbps(self) -> float:
+        if self.read_seconds <= 0:
+            return 0.0
+        return self.read_bytes / 1e6 / self.read_seconds
+
+    @property
+    def write_mbps(self) -> float:
+        if self.write_seconds <= 0:
+            return 0.0
+        return self.write_bytes / 1e6 / self.write_seconds
+
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.write_bytes:
+            parts.append(
+                f"write {self.write_bytes / 1e6:.1f} MB @ {self.write_mbps:.0f} MB/s"
+            )
+        if self.read_bytes:
+            parts.append(
+                f"read {self.read_bytes / 1e6:.1f} MB @ {self.read_mbps:.0f} MB/s"
+            )
+        return ", ".join(parts) if parts else "no payload I/O"
+
+
+_io_stats: ContextVar[IoStats | None] = ContextVar("cherrybin_io_stats", default=None)
+
+
+def _record_io(op: Literal["read", "write"], nbytes: int, elapsed: float) -> None:
+    stats = _io_stats.get()
+    if stats is None or nbytes <= 0 or elapsed < 0:
+        return
+    if op == "read":
+        stats.read_bytes += nbytes
+        stats.read_seconds += elapsed
+    else:
+        stats.write_bytes += nbytes
+        stats.write_seconds += elapsed
+
+
+@contextlib.contextmanager
+def tracking_io_stats():
+    """Track archive payload read/write throughput for the wrapped operation."""
+    stats = IoStats()
+    token = _io_stats.set(stats)
+    try:
+        yield stats
+    finally:
+        _io_stats.reset(token)
+
+
+@dataclass
 class BenchmarkStats:
     name: str
     file_count: int
     total_bytes: int
+    io: IoStats = field(default_factory=IoStats)
 
 
 @dataclass
@@ -160,6 +219,8 @@ class IndexStats:
     unchanged: int
     new_bytes: int
     file_count: int
+    deduped: int = 0
+    io: IoStats = field(default_factory=IoStats)
 
     @property
     def changed(self) -> bool:
@@ -198,47 +259,51 @@ def add_benchmark(
     benchmark: str,
     *,
     io_chunk: int | None = None,
-    blobs_dir: str | None = None,
+    db_path: str = "",
 ) -> BenchmarkStats:
     """(Re)index one benchmark's files from <source_root>/<benchmark>/**.
 
-    ``blobs_dir``, if given, appends every file to the archive's single
-    append-only blob file; sqlite holds only the ledger (hash, size, offset).
+    Payloads are appended to ``resolve_blob_file(db_path)``; sqlite is the ledger.
     """
+    if not db_path:
+        raise ValueError("db_path is required")
     with using_io_chunk(io_chunk):
         bench_dir = os.path.join(source_root, benchmark)
         if not os.path.isdir(bench_dir):
             raise FileNotFoundError(bench_dir)
 
-        # Drop this benchmark's old file list; blobs are untouched since
-        # other benchmarks may still reference them.
-        con.execute("DELETE FROM benchmark_files WHERE benchmark = ?", (benchmark,))
+        with tracking_io_stats() as io:
+            # Drop this benchmark's old file list; blobs are untouched since
+            # other benchmarks may still reference them.
+            con.execute("DELETE FROM benchmark_files WHERE benchmark = ?", (benchmark,))
 
-        n_files = 0
-        n_new_blobs = 0
-        new_bytes = 0
+            n_files = 0
+            n_new_blobs = 0
+            new_bytes = 0
 
-        for root, _, files in os.walk(bench_dir):
-            for fname in files:
-                full_path = os.path.join(root, fname)
-                relpath = os.path.relpath(full_path, bench_dir).replace(os.sep, "/")
-                digest = sha256_file(full_path)
-                size = os.path.getsize(full_path)
-                mtime = os.path.getmtime(full_path)
+            for root, _, files in os.walk(bench_dir):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    relpath = os.path.relpath(full_path, bench_dir).replace(os.sep, "/")
+                    digest = sha256_file(full_path)
+                    size = os.path.getsize(full_path)
+                    mtime = os.path.getmtime(full_path)
 
-                if _ensure_blob(con, digest, full_path, size, blobs_dir=blobs_dir):
-                    n_new_blobs += 1
-                    new_bytes += size
+                    if _ensure_blob(con, digest, full_path, size, db_path=db_path):
+                        n_new_blobs += 1
+                        new_bytes += size
 
-                con.execute(
-                    "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
-                    "VALUES (?, ?, ?, ?)",
-                    (benchmark, relpath, digest, mtime),
-                )
-                n_files += 1
+                    con.execute(
+                        "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
+                        "VALUES (?, ?, ?, ?)",
+                        (benchmark, relpath, digest, mtime),
+                    )
+                    n_files += 1
 
-        con.commit()
-        return BenchmarkStats(name=benchmark, file_count=n_files, total_bytes=new_bytes)
+            con.commit()
+            return BenchmarkStats(
+                name=benchmark, file_count=n_files, total_bytes=new_bytes, io=io
+            )
 
 
 def _prefixed_relpath(full_path: str, root: str, prefix: str) -> str:
@@ -284,8 +349,9 @@ def _walk_roots(roots: list[tuple[str, str]]) -> dict[str, tuple[str, float, str
     return found
 
 
-def _copy_file_to_blob(src, dest, size: int | None = None) -> None:
-    """Copy ``src`` to ``dest`` in chunks. Both are file-like."""
+def _copy_file_to_blob(src, dest, size: int | None = None) -> int:
+    """Copy ``src`` to ``dest`` in chunks. Both are file-like. Returns bytes copied."""
+    copied = 0
     remaining = size
     while remaining is None or remaining > 0:
         step = _current_io_chunk()
@@ -294,51 +360,33 @@ def _copy_file_to_blob(src, dest, size: int | None = None) -> None:
         if not chunk:
             break
         dest.write(chunk)
+        copied += len(chunk)
         if remaining is not None:
             remaining -= len(chunk)
+    return copied
 
 
-def _insert_blob_from_file(con: sqlite3.Connection, digest: str, full_path: str, size: int) -> None:
-    """Store a file as a blob without loading it into RAM."""
-    con.execute(
-        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(?))",
-        (digest, size, size),
-    )
-    (rowid,) = con.execute("SELECT rowid FROM blobs WHERE hash = ?", (digest,)).fetchone()
-    with open(full_path, "rb") as src, con.blobopen("blobs", "data", rowid) as dest:
-        _copy_file_to_blob(src, dest, size)
+def _stream_copy(
+    src, dest, size: int | None = None, *, op: Literal["read", "write"]
+) -> int:
+    """Like ``_copy_file_to_blob`` but records archive payload throughput."""
+    t0 = time.perf_counter()
+    copied = _copy_file_to_blob(src, dest, size)
+    _record_io(op, copied, time.perf_counter() - t0)
+    return copied
 
 
-def _extract_blob_to_file(con: sqlite3.Connection, digest: str, dest_path: str) -> None:
-    """Write one blobs.data row to disk without loading it into RAM."""
-    row = con.execute("SELECT rowid FROM blobs WHERE hash = ?", (digest,)).fetchone()
-    if row is None:
-        raise KeyError(f"blob {digest} not found")
-    tmp_path = dest_path + ".tmp"
-    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-    with con.blobopen("blobs", "data", row[0], readonly=True) as src, open(tmp_path, "wb") as dest:
-        _copy_file_to_blob(src, dest)
-    os.replace(tmp_path, dest_path)
-
-
-def _chunk_hashes(con: sqlite3.Connection, digest: str) -> list[str]:
-    return [
-        row[0]
-        for row in con.execute(
-            "SELECT chunk_hash FROM file_chunks WHERE hash = ? ORDER BY seq",
-            (digest,),
-        )
-    ]
-
-
-def _blob_row(con: sqlite3.Connection, digest: str) -> tuple[int, int | None, int] | None:
-    """Return ``(size, offset, data_len)`` for one blob hash, or ``None``."""
+def _blob_row(con: sqlite3.Connection, digest: str) -> tuple[int, int] | None:
+    """Return ``(size, offset)`` for one blob hash, or ``None``."""
     row = con.execute(
-        "SELECT size, offset, length(data) FROM blobs WHERE hash = ?", (digest,)
+        "SELECT size, offset FROM blobs WHERE hash = ?", (digest,)
     ).fetchone()
     if row is None:
         return None
-    return row[0], row[1], row[2]
+    size, offset = row
+    if offset is None:
+        raise KeyError(f"blob {digest} has no offset")
+    return size, offset
 
 
 def _extract_range_to_file(blob_path: str, offset: int, size: int, dest_path: str) -> None:
@@ -347,101 +395,19 @@ def _extract_range_to_file(blob_path: str, offset: int, size: int, dest_path: st
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     with open(blob_path, "rb") as src, open(tmp_path, "wb") as dest:
         src.seek(offset)
-        _copy_file_to_blob(src, dest, size)
+        _stream_copy(src, dest, size, op="read")
     os.replace(tmp_path, dest_path)
 
 
 def _extract_file_to_path(
-    con: sqlite3.Connection, digest: str, dest_path: str, blobs_dir: str | None = None
+    con: sqlite3.Connection, digest: str, dest_path: str, db_path: str
 ) -> None:
-    """Materialize one file: append-only blob, legacy layouts, or inline sqlite."""
+    """Read one payload from the append-only ``<db>.blobs`` file."""
     row = _blob_row(con, digest)
     if row is None:
         raise KeyError(f"blob {digest} not found")
-    size, offset, data_len = row
-
-    if offset is not None and blobs_dir is not None:
-        _extract_range_to_file(os.path.join(blobs_dir, "data"), offset, size, dest_path)
-        return
-
-    if blobs_dir is not None:
-        legacy = _legacy_external_blob_path(blobs_dir, digest)
-        if os.path.exists(legacy):
-            link_or_copy(legacy, dest_path)
-            return
-
-    parts = _chunk_hashes(con, digest)
-    if parts:
-        tmp_path = dest_path + ".tmp"
-        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-        with open(tmp_path, "wb") as dest:
-            for chunk_hash in parts:
-                chunk_row = con.execute(
-                    "SELECT rowid FROM blobs WHERE hash = ?", (chunk_hash,)
-                ).fetchone()
-                if chunk_row is None:
-                    raise KeyError(f"chunk {chunk_hash} not found")
-                with con.blobopen("blobs", "data", chunk_row[0], readonly=True) as src:
-                    _copy_file_to_blob(src, dest)
-        os.replace(tmp_path, dest_path)
-        return
-
-    if data_len > 0:
-        _extract_blob_to_file(con, digest, dest_path)
-        return
-
-    raise KeyError(f"blob {digest} has no stored payload")
-
-
-def _insert_chunked_file(
-    con: sqlite3.Connection, digest: str, full_path: str, size: int
-) -> int:
-    """Store a large file as ordered chunk blobs. Returns new blob bytes.
-
-    The whole-file marker row in ``blobs`` is inserted last, once every
-    chunk it points to (via ``file_chunks``) is already in place. A caller
-    that commits per file then never leaves a committed ``blobs`` row
-    whose chunks are incomplete -- ``_ensure_blob`` treats that row's mere
-    existence as "already archived" and would otherwise skip re-indexing
-    a file that got cut off mid-write.
-    """
-    new_bytes = 0
-    seq = 0
-    with open(full_path, "rb") as src:
-        while True:
-            hasher = hashlib.sha256()
-            fd, tmp_path = tempfile.mkstemp(prefix="cherrybin-chunk-")
-            try:
-                copied = 0
-                with os.fdopen(fd, "wb") as tmp:
-                    while copied < _BLOB_CHUNK:
-                        buf = src.read(min(_current_io_chunk(), _BLOB_CHUNK - copied))
-                        if not buf:
-                            break
-                        hasher.update(buf)
-                        tmp.write(buf)
-                        copied += len(buf)
-                if copied == 0:
-                    break
-                chunk_hash = hasher.hexdigest()
-                if con.execute("SELECT 1 FROM blobs WHERE hash = ?", (chunk_hash,)).fetchone() is None:
-                    _insert_blob_from_file(con, chunk_hash, tmp_path, copied)
-                    new_bytes += copied
-                con.execute(
-                    "INSERT INTO file_chunks (hash, seq, chunk_hash) VALUES (?, ?, ?)",
-                    (digest, seq, chunk_hash),
-                )
-                seq += 1
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except FileNotFoundError:
-                    pass
-    con.execute(
-        "INSERT INTO blobs (hash, size, data) VALUES (?, ?, zeroblob(0))",
-        (digest, size),
-    )
-    return new_bytes
+    size, offset = row
+    _extract_range_to_file(resolve_blob_file(db_path), offset, size, dest_path)
 
 
 def _publish_blob_file(src: str, dest: str) -> None:
@@ -467,24 +433,22 @@ def _publish_blob_file(src: str, dest: str) -> None:
 
 def _append_file_to_blob(full_path: str, size: int, blob_path: str) -> int:
     """Append ``full_path`` to ``blob_path`` and return the byte offset."""
-    os.makedirs(os.path.dirname(blob_path) or ".", exist_ok=True)
     offset = os.path.getsize(blob_path) if os.path.exists(blob_path) else 0
     with open(full_path, "rb") as src, open(blob_path, "ab") as dest:
-        _copy_file_to_blob(src, dest, size)
+        _stream_copy(src, dest, size, op="write")
     return offset
 
 
 def _insert_appended_file(
-    con: sqlite3.Connection, digest: str, full_path: str, size: int, blobs_dir: str
+    con: sqlite3.Connection, digest: str, full_path: str, size: int, db_path: str
 ) -> int:
     """Append one file to the archive blob and record it in the sqlite ledger."""
-    offset = _append_file_to_blob(full_path, size, os.path.join(blobs_dir, "data"))
+    offset = _append_file_to_blob(full_path, size, resolve_blob_file(db_path))
     con.execute(
         "INSERT INTO blobs (hash, size, data, offset) VALUES (?, ?, zeroblob(0), ?)",
         (digest, size, offset),
     )
     return size
-
 
 
 def _ensure_blob(
@@ -493,23 +457,12 @@ def _ensure_blob(
     full_path: str,
     size: int,
     *,
-    blobs_dir: str | None = None,
+    db_path: str,
 ) -> int:
-    """Insert the file if missing. Returns bytes of new blob data written.
-
-    When ``blobs_dir`` is given, every file is appended to the single
-    blob file and sqlite stores only hash/size/offset. Without
-    ``blobs_dir``, the legacy inline/chunked sqlite paths are used.
-    """
-    exists = con.execute("SELECT 1 FROM blobs WHERE hash = ?", (digest,)).fetchone()
-    if exists is not None:
+    """Insert the file if missing. Returns bytes of new blob data written."""
+    if con.execute("SELECT 1 FROM blobs WHERE hash = ?", (digest,)).fetchone() is not None:
         return 0
-    if blobs_dir is not None:
-        return _insert_appended_file(con, digest, full_path, size, blobs_dir)
-    if size <= _BLOB_CHUNK:
-        _insert_blob_from_file(con, digest, full_path, size)
-        return size
-    return _insert_chunked_file(con, digest, full_path, size)
+    return _insert_appended_file(con, digest, full_path, size, db_path)
 
 
 def index_roots(
@@ -518,24 +471,23 @@ def index_roots(
     roots: list[tuple[str, str]],
     *,
     io_chunk: int | None = None,
-    blobs_dir: str | None = None,
+    db_path: str = "",
 ) -> IndexStats:
     """Incrementally sync one benchmark's file list from ``roots``.
 
-    ``roots`` is a list of ``(abs_dir, prefix)``. Files are stored as
-    ``<prefix>/<relpath>`` (prefix may be empty). New blobs are inserted,
-    vanished files are dropped from this benchmark only, unchanged rows
-    are left alone. See ``_ensure_blob`` for ``blobs_dir``.
+    Payloads append to ``resolve_blob_file(db_path)``; sqlite is the ledger.
     """
+    if not db_path:
+        raise ValueError("db_path is required")
     with using_io_chunk(io_chunk):
-        return _index_roots(con, name, roots, blobs_dir)
+        return _index_roots(con, name, roots, db_path)
 
 
 def _index_roots(
     con: sqlite3.Connection,
     name: str,
     roots: list[tuple[str, str]],
-    blobs_dir: str | None = None,
+    db_path: str,
 ) -> IndexStats:
     old = {
         relpath: digest
@@ -544,62 +496,77 @@ def _index_roots(
             (name,),
         )
     }
-    new = _walk_roots(roots)
+    with tracking_io_stats() as io:
+        new = _walk_roots(roots)
 
-    added = 0
-    removed = 0
-    unchanged = 0
-    new_bytes = 0
-    start = time.time()
-    last_log = start
+        added = 0
+        removed = 0
+        unchanged = 0
+        deduped = 0
+        new_bytes = 0
+        start = time.time()
+        last_log = start
 
-    for relpath, (digest, mtime, full_path, size) in new.items():
-        old_hash = old.get(relpath)
-        if old_hash == digest:
-            unchanged += 1
-            continue
+        for relpath, (digest, mtime, full_path, size) in new.items():
+            old_hash = old.get(relpath)
+            if old_hash == digest:
+                unchanged += 1
+                continue
 
-        new_bytes += _ensure_blob(con, digest, full_path, size, blobs_dir=blobs_dir)
-        if old_hash is None:
-            con.execute(
-                "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
-                "VALUES (?, ?, ?, ?)",
-                (name, relpath, digest, mtime),
-            )
-        else:
-            con.execute(
-                "UPDATE benchmark_files SET hash = ?, mtime = ? "
-                "WHERE benchmark = ? AND relpath = ?",
-                (digest, mtime, name, relpath),
-            )
-        added += 1
-        # Commit per file rather than once for the whole benchmark: bounds
-        # how much WAL a huge tree piles up before it can checkpoint, and
-        # means a crash mid-benchmark only loses the file in flight
-        # instead of every file already stored.
+            written = _ensure_blob(con, digest, full_path, size, db_path=db_path)
+            new_bytes += written
+            if written == 0:
+                deduped += 1
+            if old_hash is None:
+                con.execute(
+                    "INSERT INTO benchmark_files (benchmark, relpath, hash, mtime) "
+                    "VALUES (?, ?, ?, ?)",
+                    (name, relpath, digest, mtime),
+                )
+            else:
+                con.execute(
+                    "UPDATE benchmark_files SET hash = ?, mtime = ? "
+                    "WHERE benchmark = ? AND relpath = ?",
+                    (digest, mtime, name, relpath),
+                )
+            added += 1
+            # Commit per file rather than once for the whole benchmark: bounds
+            # how much WAL a huge tree piles up before it can checkpoint, and
+            # means a crash mid-benchmark only loses the file in flight
+            # instead of every file already stored.
+            con.commit()
+            now = time.time()
+            if now - last_log >= 30:
+                _log(
+                    f"'{name}': {added} files committed, {new_bytes / 1e9:.1f} GB new, "
+                    f"{now - start:.0f}s elapsed"
+                )
+                last_log = now
+
+        for relpath in old:
+            if relpath not in new:
+                con.execute(
+                    "DELETE FROM benchmark_files WHERE benchmark = ? AND relpath = ?",
+                    (name, relpath),
+                )
+                removed += 1
+
         con.commit()
-        now = time.time()
-        if now - last_log >= 30:
-            _log(f"'{name}': {added} files committed, {new_bytes / 1e9:.1f} GB new, {now - start:.0f}s elapsed")
-            last_log = now
-
-    for relpath in old:
-        if relpath not in new:
-            con.execute(
-                "DELETE FROM benchmark_files WHERE benchmark = ? AND relpath = ?",
-                (name, relpath),
+        if added or removed:
+            _log(
+                f"'{name}': {added} file entries, "
+                f"{new_bytes / 1e9:.1f} GB new blobs, {deduped} deduped"
             )
-            removed += 1
-
-    con.commit()
-    return IndexStats(
-        name=name,
-        added=added,
-        removed=removed,
-        unchanged=unchanged,
-        new_bytes=new_bytes,
-        file_count=len(new),
-    )
+        return IndexStats(
+            name=name,
+            added=added,
+            removed=removed,
+            unchanged=unchanged,
+            new_bytes=new_bytes,
+            file_count=len(new),
+            deduped=deduped,
+            io=io,
+        )
 
 
 def remove_benchmark(con: sqlite3.Connection, benchmark: str) -> int:
@@ -608,35 +575,18 @@ def remove_benchmark(con: sqlite3.Connection, benchmark: str) -> int:
     return cur.rowcount
 
 
-def gc_unreferenced_blobs(con: sqlite3.Connection, blobs_dir: str | None = None) -> int:
+def gc_unreferenced_blobs(con: sqlite3.Connection) -> int:
     """Remove unreferenced blobs from the sqlite ledger, then VACUUM.
 
-    The append-only blob file is not rewritten here; dead regions remain
-    until a future defrag command compacts ``<db>.blobs/data``.
-
-    Legacy per-hash external files are removed when ``blobs_dir`` is set.
+    The append-only ``<db>.blobs`` file is not rewritten; dead regions remain
+    until a future defrag command compacts it.
     """
-    con.execute(
-        "DELETE FROM file_chunks WHERE hash NOT IN "
-        "(SELECT DISTINCT hash FROM benchmark_files)"
+    cur = con.execute(
+        "DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM benchmark_files)"
     )
-    still_referenced = "SELECT hash FROM benchmark_files UNION SELECT chunk_hash FROM file_chunks"
-    orphans = con.execute(
-        f"SELECT hash, offset FROM blobs WHERE hash NOT IN ({still_referenced})"
-    ).fetchall()
-    cur = con.execute(f"DELETE FROM blobs WHERE hash NOT IN ({still_referenced})")
     con.commit()
     removed = cur.rowcount
     con.execute("VACUUM")
-
-    if blobs_dir is not None:
-        for digest, offset in orphans:
-            if offset is None:
-                try:
-                    os.remove(_legacy_external_blob_path(blobs_dir, digest))
-                except FileNotFoundError:
-                    pass
-
     return removed
 
 
@@ -743,21 +693,9 @@ def publish(local_path: str, shared_dir: str, version: str) -> str:
     if os.path.exists(final_path):
         raise FileExistsError(f"{final_path} already exists, choose a new version name")
 
-    local_blobs = resolve_blobs_dir(local_path)
-    local_blob_file = os.path.join(local_blobs, "data")
-    if os.path.exists(local_blob_file):
-        shared_blobs = resolve_blobs_dir(final_path)
-        _publish_blob_file(local_blob_file, os.path.join(shared_blobs, "data"))
-    # Legacy per-hash external files from older archives.
-    if os.path.isdir(local_blobs):
-        shared_blobs = resolve_blobs_dir(final_path)
-        for root, _, files in os.walk(local_blobs):
-            for fname in files:
-                if fname == "data" and root == local_blobs:
-                    continue
-                src = os.path.join(root, fname)
-                dest = os.path.join(shared_blobs, os.path.relpath(src, local_blobs))
-                _publish_blob_file(src, dest)
+    local_blob = resolve_blob_file(local_path)
+    if os.path.isfile(local_blob):
+        _publish_blob_file(local_blob, resolve_blob_file(final_path))
 
     shutil.copyfile(local_path, tmp_path)
     os.replace(tmp_path, final_path)  # atomic: readers never see a partial file
@@ -784,16 +722,6 @@ def _checkpoint_and_close(con: sqlite3.Connection) -> None:
     con.close()
 
 
-def replace_file(src: str, dest: str) -> str:
-    """Copy ``src`` next to ``dest`` as ``.uploading``, then atomically replace."""
-    dest = os.path.abspath(dest)
-    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-    tmp_path = dest + ".uploading"
-    shutil.copyfile(src, tmp_path)
-    os.replace(tmp_path, dest)
-    return dest
-
-
 def update_files(
     shared_db: str,
     items: list[tuple[str, list[tuple[str, str]]]],
@@ -803,43 +731,36 @@ def update_files(
 ) -> list[IndexStats]:
     """Create or incrementally update ``shared_db`` from named root lists.
 
-    Never mutates the live file in place: copy locally, index, then
-    ``os.replace`` via ``*.uploading`` if anything changed (or the file
-    is being created). Payload bytes (see ``_ensure_blob``) are appended
-    straight to ``resolve_blob_file(shared_db)`` as each file is indexed,
-    not buffered through ``local.db``. A crash mid-index may leave dead
-    tail bytes in the blob file until defrag; only the sqlite ledger is
-    retried.
+    Updates the sqlite ledger and blob file in place under an advisory lock.
+    Payload bytes (see ``_ensure_blob``) are appended to
+    ``resolve_blob_file(shared_db)`` as each file is indexed. A crash
+    mid-index may leave dead tail bytes in the blob file until defrag;
+    re-running the update retries ledger writes only.
     """
     shared_db = os.path.abspath(shared_db)
-    existed = os.path.exists(shared_db)
-    blobs_dir = resolve_blobs_dir(shared_db)
 
     with file_lock(shared_db, timeout=lock_timeout):
-        with tempfile.TemporaryDirectory() as tmp:
-            local = os.path.join(tmp, "local.db")
-            if existed:
-                size_gb = os.path.getsize(shared_db) / 1e9
-                _log(f"copying existing archive ({size_gb:.1f} GB) {shared_db} -> {local}")
+        if os.path.exists(shared_db):
+            _log_archive_sizes(shared_db, prefix="opening")
+
+        con = connect_writable(shared_db)
+        stats = []
+        try:
+            for name, roots in items:
+                _log(f"indexing '{name}'...")
                 t0 = time.time()
-                shutil.copyfile(shared_db, local)
-                _log(f"copy done in {time.time() - t0:.0f}s")
-
-            con = connect_writable(local)
-            stats = []
-            try:
-                for name, roots in items:
-                    _log(f"indexing '{name}'...")
-                    t0 = time.time()
-                    stats.append(index_roots(con, name, roots, io_chunk=io_chunk, blobs_dir=blobs_dir))
-                    _log(f"indexed '{name}' in {time.time() - t0:.0f}s")
-            finally:
-                _checkpoint_and_close(con)
-
-            any_changed = any(s.changed for s in stats)
-            if any_changed or not existed:
-                _log(f"publishing updated archive -> {shared_db}")
-                replace_file(local, shared_db)
+                stat = index_roots(
+                    con, name, roots, io_chunk=io_chunk, db_path=shared_db
+                )
+                stats.append(stat)
+                _log(
+                    f"indexed '{name}' in {time.time() - t0:.0f}s, "
+                    f"{_format_size(stat.new_bytes)} new payload, "
+                    f"{stat.deduped} deduped"
+                )
+                _log_archive_sizes(shared_db, prefix="archive now")
+        finally:
+            _checkpoint_and_close(con)
 
     return stats
 
@@ -900,6 +821,7 @@ class CheckoutResult:
     file_count: int
     pulled_from_archive: int
     already_cached: int
+    io: IoStats = field(default_factory=IoStats)
 
 
 def checkout(
@@ -911,12 +833,14 @@ def checkout(
     io_chunk: int | None = None,
 ) -> CheckoutResult:
     with using_io_chunk(io_chunk):
-        return _checkout(db_path, benchmark, dest, cache_dir)
+        with tracking_io_stats() as io:
+            result = _checkout(db_path, benchmark, dest, cache_dir)
+            result.io = io
+            return result
 
 
 def _checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> CheckoutResult:
     con = open_readonly(db_path)
-    blobs_dir = resolve_blobs_dir(db_path)
     try:
         rows = con.execute(
             "SELECT relpath, hash FROM benchmark_files WHERE benchmark = ? ORDER BY hash",
@@ -938,7 +862,7 @@ def _checkout(db_path: str, benchmark: str, dest: str, cache_dir: str) -> Checko
             os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
 
             if not os.path.exists(cache_path):
-                _extract_file_to_path(con, digest, cache_path, blobs_dir=blobs_dir)
+                _extract_file_to_path(con, digest, cache_path, db_path=db_path)
                 n_extracted += 1
             else:
                 n_from_cache += 1

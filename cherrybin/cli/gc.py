@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from argklass.arguments import add_arguments
 from argklass.command import Command, newparser
 
-from cherrybin.core import connect_writable, gc_unreferenced_blobs, remove_benchmark, resolve_blobs_dir
+from cherrybin.core import connect_writable, gc_unreferenced_blobs, remove_benchmark
 
 
 @dataclass
@@ -58,7 +58,7 @@ class Gc(Command):
     def execute(self, args: GcArguments):
         con = connect_writable(args.db)
         try:
-            n = gc_unreferenced_blobs(con, blobs_dir=resolve_blobs_dir(args.db))
+            n = gc_unreferenced_blobs(con)
         finally:
             con.close()
         print(f"removed {n} unreferenced blobs")
