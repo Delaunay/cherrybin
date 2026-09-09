@@ -602,6 +602,60 @@ def test_checkout_stream_uses_fewer_seeks(tmp_path, source_tree, monkeypatch):
     assert stream_seeks <= naive_seeks
 
 
+def test_checkout_stream_writer_bounds_memory_per_write(tmp_path, monkeypatch):
+    """The writer must not buffer a whole blob before writing it out.
+
+    Regression test for an OOM: the writer used to accumulate a blob into
+    a bytearray until it reached the blob's full size before issuing a
+    single write() with the whole payload -- a multi-GiB blob would sit
+    entirely in RAM before touching disk. Assert every write() call is
+    capped at io_chunk bytes, proving data streams straight through
+    instead of piling up in memory.
+    """
+    import cherrybin.core as core
+
+    src = tmp_path / "src" / "bench"
+    src.mkdir(parents=True)
+    payload = os.urandom(4096)
+    (src / "big.bin").write_bytes(payload)
+
+    db_path = str(tmp_path / "local.db")
+    con = connect_writable(db_path)
+    add_benchmark(con, str(tmp_path / "src"), "bench", db_path=db_path)
+    con.close()
+
+    io_chunk = 64
+    write_sizes = []
+    real_open = open
+
+    def spy_open(path, mode="r", *args, **kwargs):
+        f = real_open(path, mode, *args, **kwargs)
+        if "w" in mode and "b" in mode:
+            real_write = f.write
+
+            def write(data):
+                write_sizes.append(len(data))
+                return real_write(data)
+
+            f.write = write
+        return f
+
+    monkeypatch.setattr(core, "open", spy_open, raising=False)
+
+    checkout(
+        db_path,
+        "bench",
+        str(tmp_path / "out"),
+        str(tmp_path / "cache"),
+        io_chunk=io_chunk,
+    )
+
+    assert write_sizes, "expected at least one write() call"
+    assert max(write_sizes) <= io_chunk
+    with open(os.path.join(tmp_path, "out", "big.bin"), "rb") as f:
+        assert f.read() == payload
+
+
 def test_checkout_stream_writer_failure_does_not_deadlock(tmp_path, monkeypatch):
     """A writer-side failure must surface as an exception, not hang.
 
@@ -637,8 +691,8 @@ def test_checkout_stream_writer_failure_does_not_deadlock(tmp_path, monkeypatch)
     )
 
     monkeypatch.setattr(
-        core,
-        "_write_cache_atomically",
+        os,
+        "replace",
         lambda *a, **k: (_ for _ in ()).throw(OSError("simulated disk failure")),
     )
 

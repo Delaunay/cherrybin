@@ -942,14 +942,6 @@ def _fadvise_willneed(fd: int, offset: int, length: int) -> None:
         pass
 
 
-def _write_cache_atomically(cache_path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-    tmp_path = cache_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-    os.replace(tmp_path, cache_path)
-
-
 def _split_cached_and_pending(
     plan: list[CheckoutFile],
     dest_root: str,
@@ -1072,30 +1064,64 @@ def _stream_blob_writer(
 ) -> None:
     """Consume ``block_queue`` and materialize each pending blob to cache.
 
+    Each incoming block is written straight to the current blob's ``.tmp``
+    file as it arrives, instead of being buffered in a bytearray until the
+    whole blob is in memory. A single oversized blob (a multi-GiB
+    checkpoint, say) would otherwise have to sit entirely in RAM before a
+    single byte reached disk -- OOM-killing jobs run under a tight memory
+    cgroup even though the stream itself is chunked.
+
     See ``_stream_blob_reader`` for why every queue wait is bounded by
     ``stop_event`` rather than blocking indefinitely.
     """
-    try:
-        buf = bytearray()
-        for blob in pending:
-            while len(buf) < blob.size:
-                block = _queue_get_cancelable(block_queue, stop_event)
-                if block is _STOPPED:
-                    return  # reader already failed; nothing left to consume
-                if block is None:
-                    raise OSError("unexpected end of blob stream")
-                buf.extend(block)
+    current: PendingBlob | None = None
+    current_file = None
+    current_tmp: str | None = None
+    written = 0
 
-            payload = bytes(buf[: blob.size])
-            del buf[: blob.size]
-
+    def _open_next(pending_iter) -> PendingBlob | None:
+        nonlocal current_file, current_tmp, written
+        blob = next(pending_iter, None)
+        if blob is not None:
             cache = _cache_path(cache_dir, blob.hash)
-            t0 = time.perf_counter()
-            _write_cache_atomically(cache, payload)
-            _record_io_to(stats, "write", len(payload), time.perf_counter() - t0)
+            os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
+            current_tmp = cache + ".tmp"
+            current_file = open(current_tmp, "wb")
+            written = 0
+        return blob
 
-            for dest_path in blob.dest_paths:
-                link_or_copy(cache, dest_path)
+    def _finish_current(blob: PendingBlob) -> None:
+        current_file.close()
+        cache = _cache_path(cache_dir, blob.hash)
+        os.replace(current_tmp, cache)
+        for dest_path in blob.dest_paths:
+            link_or_copy(cache, dest_path)
+
+    try:
+        pending_iter = iter(pending)
+        current = _open_next(pending_iter)
+
+        while current is not None:
+            block = _queue_get_cancelable(block_queue, stop_event)
+            if block is _STOPPED:
+                return  # reader already failed; nothing left to consume
+            if block is None:
+                raise OSError("unexpected end of blob stream")
+
+            offset = 0
+            while offset < len(block):
+                take = min(len(block) - offset, current.size - written)
+                t0 = time.perf_counter()
+                current_file.write(block[offset : offset + take])
+                _record_io_to(stats, "write", take, time.perf_counter() - t0)
+                written += take
+                offset += take
+
+                if written == current.size:
+                    _finish_current(current)
+                    current = _open_next(pending_iter)
+                    if current is None and offset < len(block):
+                        raise OSError("trailing data after blob stream")
 
         sentinel = _queue_get_cancelable(block_queue, stop_event)
         if sentinel is not _STOPPED and sentinel is not None:
@@ -1104,6 +1130,11 @@ def _stream_blob_writer(
         if error[0] is None:
             error[0] = exc
         stop_event.set()
+        if current_file is not None:
+            try:
+                current_file.close()
+            except OSError:
+                pass
 
 
 def _record_io_to(
