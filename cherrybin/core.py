@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 # Default stream size for hashing / blob copy. Override via ``io_chunk=``
 # on the public APIs or ``--io-chunk`` on the CLI (bytes).
-DEFAULT_IO_CHUNK = 4 * 1024 * 1024
+DEFAULT_IO_CHUNK = 16 * 1024 * 1024
 DEFAULT_STREAM_QUEUE_DEPTH = 8
 _HASH_CHUNK = DEFAULT_IO_CHUNK
 
